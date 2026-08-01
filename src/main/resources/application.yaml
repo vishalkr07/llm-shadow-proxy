@@ -26,9 +26,9 @@ management:
 proxy:
   upstream:
     base-url: ${DO_INFERENCE_BASE_URL:https://inference.do-ai.run}
-    api-key: ${DO_INFERENCE_API_KEY}
-    primary-model: ${PRIMARY_MODEL}
-    candidate-model: ${CANDIDATE_MODEL}
+    api-key: ${DO_INFERENCE_API_KEY:}
+    primary-model: ${PRIMARY_MODEL:}
+    candidate-model: ${CANDIDATE_MODEL:}
   limits:
     max-concurrent-requests: ${MAX_CONCURRENT_REQUESTS:128}
     max-request-bytes: ${MAX_REQUEST_BYTES:131072}
@@ -46,6 +46,9 @@ proxy:
     task-ttl: ${SHADOW_TASK_TTL:30s}
     sample-rate: ${SHADOW_SAMPLE_RATE:1.0}
     control-arm-rate: ${SHADOW_CONTROL_ARM_RATE:0.01}
+  mock:
+    enabled: ${MOCK_INFERENCE_ENABLED:false}
+    actions: ${MOCK_INFERENCE_ACTIONS:approve,reject,refund,cancel,escalate}
   allow-aa-mode: ${ALLOW_AA_MODE:false}
 
 logging:

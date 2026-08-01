@@ -2,7 +2,7 @@ package com.example.shadowproxy.shadow;
 
 import com.example.shadowproxy.config.ProxyProperties;
 import com.example.shadowproxy.eval.Evaluator;
-import com.example.shadowproxy.inference.InferenceClient;
+import com.example.shadowproxy.inference.InferenceGateway;
 import com.example.shadowproxy.metrics.MetricsRecorder;
 import com.example.shadowproxy.metrics.ShadowOutcome;
 import com.example.shadowproxy.metrics.ShedReason;
@@ -19,7 +19,7 @@ final class ShadowTask implements Runnable {
     private final long reservedBytes;
     private final ByteBudget byteBudget;
     private final ProxyProperties properties;
-    private final InferenceClient candidateClient;
+    private final InferenceGateway candidateClient;
     private final Evaluator evaluator;
     private final MetricsRecorder metrics;
     private final AtomicBoolean released = new AtomicBoolean();
@@ -30,7 +30,7 @@ final class ShadowTask implements Runnable {
             long reservedBytes,
             ByteBudget byteBudget,
             ProxyProperties properties,
-            InferenceClient candidateClient,
+            InferenceGateway candidateClient,
             Evaluator evaluator,
             MetricsRecorder metrics) {
         this.job = job;

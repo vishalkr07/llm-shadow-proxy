@@ -1,13 +1,13 @@
 package com.example.shadowproxy.config;
 
 import com.example.shadowproxy.inference.InferenceClient;
-import org.apache.hc.client5.http.classic.HttpClient;
+import com.example.shadowproxy.inference.InferenceGateway;
+import com.example.shadowproxy.inference.MockInferenceClient;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.core5.util.Timeout;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
@@ -19,53 +19,41 @@ import tools.jackson.databind.ObjectMapper;
 public class InferenceClientConfig {
 
     @Bean(destroyMethod = "close")
-    CloseableHttpClient primaryHttpClient(ProxyProperties properties) {
-        return httpClient(
+    InferenceGateway primaryInferenceClient(
+            ObjectMapper objectMapper, ProxyProperties properties) {
+        if (properties.mock().enabled()) {
+            return new MockInferenceClient(
+                    objectMapper, properties.mock().actions(), "mock-primary");
+        }
+        return realClient(
+                objectMapper,
                 properties,
                 properties.timeouts().primary(),
-                properties.limits().maxConcurrentRequests());
+                properties.limits().maxConcurrentRequests(),
+                false);
     }
 
     @Bean(destroyMethod = "close")
-    CloseableHttpClient candidateHttpClient(ProxyProperties properties) {
-        return httpClient(
-                properties, properties.timeouts().shadow(), properties.shadow().workers());
+    InferenceGateway candidateInferenceClient(
+            ObjectMapper objectMapper, ProxyProperties properties) {
+        if (properties.mock().enabled()) {
+            return new MockInferenceClient(
+                    objectMapper, properties.mock().actions(), "mock-candidate");
+        }
+        return realClient(
+                objectMapper,
+                properties,
+                properties.timeouts().shadow(),
+                properties.shadow().workers(),
+                true);
     }
 
-    @Bean
-    RestClient primaryRestClient(
-            ProxyProperties properties,
-            @Qualifier("primaryHttpClient") HttpClient httpClient) {
-        return restClient(properties, httpClient);
-    }
-
-    @Bean
-    RestClient candidateRestClient(
-            ProxyProperties properties,
-            @Qualifier("candidateHttpClient") HttpClient httpClient) {
-        return restClient(properties, httpClient);
-    }
-
-    @Bean
-    InferenceClient primaryInferenceClient(
-            @Qualifier("primaryRestClient") RestClient restClient,
+    private static InferenceGateway realClient(
             ObjectMapper objectMapper,
-            ProxyProperties properties) {
-        return new InferenceClient(
-                restClient, objectMapper, properties.limits().maxResponseBytes(), false);
-    }
-
-    @Bean
-    InferenceClient candidateInferenceClient(
-            @Qualifier("candidateRestClient") RestClient restClient,
-            ObjectMapper objectMapper,
-            ProxyProperties properties) {
-        return new InferenceClient(
-                restClient, objectMapper, properties.limits().maxResponseBytes(), true);
-    }
-
-    private static CloseableHttpClient httpClient(
-            ProxyProperties properties, java.time.Duration readTimeout, int maxConnections) {
+            ProxyProperties properties,
+            java.time.Duration readTimeout,
+            int maxConnections,
+            boolean shadowRole) {
         var connectionManager =
                 PoolingHttpClientConnectionManagerBuilder.create()
                         .setMaxConnTotal(maxConnections)
@@ -78,14 +66,13 @@ public class InferenceClientConfig {
                                         .build())
                         .build();
 
-        return HttpClients.custom()
+        CloseableHttpClient httpClient =
+                HttpClients.custom()
                 .setConnectionManager(connectionManager)
                 .disableAutomaticRetries()
                 .build();
-    }
-
-    private static RestClient restClient(ProxyProperties properties, HttpClient httpClient) {
-        return RestClient.builder()
+        RestClient restClient =
+                RestClient.builder()
                 .baseUrl(properties.upstream().baseUrl())
                 .requestFactory(new HttpComponentsClientHttpRequestFactory(httpClient))
                 .defaultHeaders(
@@ -94,5 +81,11 @@ public class InferenceClientConfig {
                             headers.set(HttpHeaders.ACCEPT_ENCODING, "identity");
                         })
                 .build();
+        return new InferenceClient(
+                restClient,
+                objectMapper,
+                properties.limits().maxResponseBytes(),
+                shadowRole,
+                httpClient);
     }
 }

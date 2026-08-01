@@ -1,6 +1,8 @@
 package com.example.shadowproxy.inference;
 
 import java.util.Arrays;
+import java.io.IOException;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
@@ -8,7 +10,7 @@ import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
-public final class InferenceClient {
+public final class InferenceClient implements InferenceGateway {
     private static final String COMPLETIONS_PATH = "/v1/chat/completions";
     private static final String SHADOW_HEADER = "X-Shadow-Request";
 
@@ -16,18 +18,22 @@ public final class InferenceClient {
     private final ObjectMapper objectMapper;
     private final int maxResponseBytes;
     private final boolean shadowRole;
+    private final CloseableHttpClient httpClient;
 
     public InferenceClient(
             RestClient restClient,
             ObjectMapper objectMapper,
             int maxResponseBytes,
-            boolean shadowRole) {
+            boolean shadowRole,
+            CloseableHttpClient httpClient) {
         this.restClient = restClient;
         this.objectMapper = objectMapper;
         this.maxResponseBytes = maxResponseBytes;
         this.shadowRole = shadowRole;
+        this.httpClient = httpClient;
     }
 
+    @Override
     public ChatCompletion complete(String model, byte[] requestBody) {
         byte[] upstreamBody = withModelOverride(model, requestBody);
 
@@ -71,6 +77,15 @@ public final class InferenceClient {
             throw exception;
         } catch (JacksonException exception) {
             throw new InvalidChatRequestException("request body must be valid JSON", exception);
+        }
+    }
+
+    @Override
+    public void close() {
+        try {
+            httpClient.close();
+        } catch (IOException exception) {
+            throw new IllegalStateException("could not close inference HTTP client", exception);
         }
     }
 }

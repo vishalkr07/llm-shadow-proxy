@@ -71,6 +71,7 @@ class BoundedShadowDispatcherTest {
                         Duration.ofSeconds(1)),
                 new ProxyProperties.Shadow(
                         1, 1, 8192, Duration.ofSeconds(30), 1.0, 0.0),
+                new ProxyProperties.Mock(false, java.util.List.of("approve")),
                 false);
     }
 

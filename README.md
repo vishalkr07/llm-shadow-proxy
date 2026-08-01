@@ -116,6 +116,8 @@ law rather than chosen.
 | `PRIMARY_MODEL` | **required** | Model serving customer traffic, e.g. `llama3.3-70b-instruct` |
 | `CANDIDATE_MODEL` | **required** | Model under evaluation |
 | `DO_INFERENCE_BASE_URL` | `https://inference.do-ai.run` | Upstream base URL; pointed at WireMock locally |
+| `MOCK_INFERENCE_ENABLED` | `false` | Replace both outbound clients with local random-action clients; no API key or model names required |
+| `MOCK_INFERENCE_ACTIONS` | `approve,reject,refund,cancel,escalate` | Comma-separated action values sampled independently by the mock primary and candidate |
 | `SERVER_PORT` | `8080` | Bind port |
 | `MANAGEMENT_SERVER_PORT` | `9090` | Actuator health port, not published externally |
 | `MAX_CONCURRENT_REQUESTS` | `128` | In-flight inbound request cap; beyond it the service returns `503` |
@@ -149,6 +151,24 @@ The main API listens on `http://localhost:8080`. Health probes are separate:
 ```bash
 curl -s http://localhost:9090/actuator/health
 ```
+
+### Run without DigitalOcean in mock mode
+
+Mock mode needs no API key and makes no network calls. Both model roles return an
+OpenAI-compatible completion whose assistant content is a JSON object containing
+one independently selected action:
+
+```bash
+MOCK_INFERENCE_ENABLED=true \
+MOCK_INFERENCE_ACTIONS=approve,reject,refund,cancel,escalate \
+./gradlew bootRun
+```
+
+The primary and candidate draw independently from the same list, so repeated
+requests naturally produce both matches and mismatches. With `N` equally likely
+actions, the expected exact-match rate is approximately `1/N`; this makes the
+metrics walkthrough deterministic in shape without forcing every comparison to
+match.
 
 ## Step-by-step usage and metrics
 

@@ -2,7 +2,7 @@ package com.example.shadowproxy.shadow;
 
 import com.example.shadowproxy.config.ProxyProperties;
 import com.example.shadowproxy.eval.Evaluator;
-import com.example.shadowproxy.inference.InferenceClient;
+import com.example.shadowproxy.inference.InferenceGateway;
 import com.example.shadowproxy.metrics.MetricsRecorder;
 import com.example.shadowproxy.metrics.ShedReason;
 import com.example.shadowproxy.metrics.ShadowGauges;
@@ -23,14 +23,14 @@ public final class BoundedShadowDispatcher implements ShadowDispatcher, ShadowGa
     private final MetricsRecorder metrics;
     private final ByteBudget byteBudget;
     private final ThreadPoolExecutor executor;
-    private final InferenceClient candidateClient;
+    private final InferenceGateway candidateClient;
     private final Evaluator evaluator;
     private volatile boolean shuttingDown;
 
     public BoundedShadowDispatcher(
             ProxyProperties properties,
             MetricsRecorder metrics,
-            @Qualifier("candidateInferenceClient") InferenceClient candidateClient,
+            @Qualifier("candidateInferenceClient") InferenceGateway candidateClient,
             Evaluator evaluator) {
         this.properties = properties;
         this.metrics = metrics;

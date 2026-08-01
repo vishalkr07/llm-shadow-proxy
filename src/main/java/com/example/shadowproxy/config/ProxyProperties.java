@@ -5,9 +5,11 @@ import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import java.time.Duration;
+import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
@@ -18,13 +20,14 @@ public record ProxyProperties(
         @Valid @NotNull Limits limits,
         @Valid @NotNull Timeouts timeouts,
         @Valid @NotNull Shadow shadow,
+        @Valid @NotNull Mock mock,
         boolean allowAaMode) {
 
     public record Upstream(
             @NotBlank String baseUrl,
-            @NotBlank String apiKey,
-            @NotBlank String primaryModel,
-            @NotBlank String candidateModel) {
+            String apiKey,
+            String primaryModel,
+            String candidateModel) {
         @Override
         public String toString() {
             return "Upstream[baseUrl=%s, apiKey=****, primaryModel=%s, candidateModel=%s]"
@@ -66,6 +69,12 @@ public record ProxyProperties(
         }
     }
 
+    public record Mock(boolean enabled, @NotEmpty List<@NotBlank String> actions) {
+        public Mock {
+            actions = actions == null ? List.of() : List.copyOf(actions);
+        }
+    }
+
     @AssertTrue(message = "SHADOW_QUEUE_SIZE must be greater than or equal to SHADOW_WORKERS")
     public boolean isQueueLargeEnough() {
         return shadow == null || shadow.queueSize() >= shadow.workers();
@@ -73,10 +82,29 @@ public record ProxyProperties(
 
     @AssertTrue(
             message =
+                    "DO_INFERENCE_API_KEY, PRIMARY_MODEL, and CANDIDATE_MODEL are required unless mock mode is enabled")
+    public boolean isRealUpstreamConfigured() {
+        return mock == null
+                || mock.enabled()
+                || (upstream != null
+                        && hasText(upstream.apiKey())
+                        && hasText(upstream.primaryModel())
+                        && hasText(upstream.candidateModel()));
+    }
+
+    @AssertTrue(
+            message =
                     "PRIMARY_MODEL and CANDIDATE_MODEL must differ unless ALLOW_AA_MODE is true")
     public boolean isModelPairMeaningful() {
         return upstream == null
+                || mock == null
+                || mock.enabled()
                 || allowAaMode
-                || !upstream.primaryModel().equals(upstream.candidateModel());
+                || !java.util.Objects.equals(
+                        upstream.primaryModel(), upstream.candidateModel());
+    }
+
+    private static boolean hasText(String value) {
+        return value != null && !value.isBlank();
     }
 }

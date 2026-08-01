@@ -1,7 +1,7 @@
 package com.example.shadowproxy.proxy;
 
 import com.example.shadowproxy.config.ProxyProperties;
-import com.example.shadowproxy.inference.InferenceClient;
+import com.example.shadowproxy.inference.InferenceGateway;
 import com.example.shadowproxy.inference.InvalidChatRequestException;
 import com.example.shadowproxy.metrics.MetricsRecorder;
 import com.example.shadowproxy.shadow.ShadowDispatcher;
@@ -23,14 +23,14 @@ import tools.jackson.databind.node.ObjectNode;
 @RestController
 @RequestMapping("/v1")
 public class ChatController {
-    private final InferenceClient primaryClient;
+    private final InferenceGateway primaryClient;
     private final ProxyProperties properties;
     private final ObjectMapper objectMapper;
     private final MetricsRecorder metrics;
     private final ShadowDispatcher shadowDispatcher;
 
     public ChatController(
-            @Qualifier("primaryInferenceClient") InferenceClient primaryClient,
+            @Qualifier("primaryInferenceClient") InferenceGateway primaryClient,
             ProxyProperties properties,
             ObjectMapper objectMapper,
             MetricsRecorder metrics,
