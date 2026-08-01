@@ -1,11 +1,19 @@
 spring:
   application:
     name: shadow-proxy
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: ${SHUTDOWN_GRACE:15s}
 
 server:
   port: ${SERVER_PORT:8080}
+  shutdown: graceful
 
 management:
+  server:
+    port: ${MANAGEMENT_SERVER_PORT:9090}
   endpoints:
     web:
       exposure:
@@ -14,3 +22,32 @@ management:
     health:
       probes:
         enabled: true
+
+proxy:
+  upstream:
+    base-url: ${DO_INFERENCE_BASE_URL:https://inference.do-ai.run}
+    api-key: ${DO_INFERENCE_API_KEY}
+    primary-model: ${PRIMARY_MODEL}
+    candidate-model: ${CANDIDATE_MODEL}
+  limits:
+    max-concurrent-requests: ${MAX_CONCURRENT_REQUESTS:128}
+    max-request-bytes: ${MAX_REQUEST_BYTES:131072}
+    max-response-bytes: ${MAX_RESPONSE_BYTES:262144}
+    max-eval-content-bytes: ${MAX_EVAL_CONTENT_BYTES:32768}
+  timeouts:
+    connect: ${CONNECT_TIMEOUT:2s}
+    primary: ${PRIMARY_TIMEOUT:30s}
+    shadow: ${SHADOW_TIMEOUT:20s}
+    shutdown-grace: ${SHUTDOWN_GRACE:15s}
+  shadow:
+    queue-size: ${SHADOW_QUEUE_SIZE:32}
+    workers: ${SHADOW_WORKERS:32}
+    budget-bytes: ${SHADOW_BUDGET_BYTES:8388608}
+    task-ttl: ${SHADOW_TASK_TTL:30s}
+    sample-rate: ${SHADOW_SAMPLE_RATE:1.0}
+    control-arm-rate: ${SHADOW_CONTROL_ARM_RATE:0.01}
+  allow-aa-mode: ${ALLOW_AA_MODE:false}
+
+logging:
+  level:
+    com.example.shadowproxy: ${LOG_LEVEL:info}
