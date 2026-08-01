@@ -145,6 +145,31 @@ class ChatProxyIntegrationTest {
         awaitCandidateRequest();
     }
 
+    @Test
+    void exposesLiveReplicaMetricsWithoutCaching() throws Exception {
+        HttpResponse<byte[]> chat = send("{\"messages\":[]}", null);
+        assertThat(chat.statusCode()).isEqualTo(200);
+        awaitCandidateRequest();
+
+        HttpRequest request =
+                HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/metric"))
+                        .GET()
+                        .build();
+        HttpResponse<String> response =
+                client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(response.headers().firstValue("Cache-Control"))
+                .hasValueSatisfying(value -> assertThat(value).contains("no-store"));
+        assertThat(response.body())
+                .contains("\"schema_version\":\"1\"")
+                .contains("\"scope\":\"replica_local\"")
+                .contains("\"total_requests\":")
+                .contains("\"queue_capacity\":32")
+                .contains("\"exact_match_rate\":")
+                .contains("\"unusable_by_reason\":");
+    }
+
     private HttpResponse<byte[]> send(String json, String authorization) throws Exception {
         HttpRequest.Builder request =
                 HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/v1/chat"))

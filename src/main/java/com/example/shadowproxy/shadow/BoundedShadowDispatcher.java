@@ -5,6 +5,7 @@ import com.example.shadowproxy.eval.Evaluator;
 import com.example.shadowproxy.inference.InferenceClient;
 import com.example.shadowproxy.metrics.MetricsRecorder;
 import com.example.shadowproxy.metrics.ShedReason;
+import com.example.shadowproxy.metrics.ShadowGauges;
 import jakarta.annotation.PreDestroy;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -17,7 +18,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 @Component
-public final class BoundedShadowDispatcher implements ShadowDispatcher {
+public final class BoundedShadowDispatcher implements ShadowDispatcher, ShadowGauges {
     private final ProxyProperties properties;
     private final MetricsRecorder metrics;
     private final ByteBudget byteBudget;
@@ -91,16 +92,44 @@ public final class BoundedShadowDispatcher implements ShadowDispatcher {
         }
     }
 
+    @Override
     public int queueDepth() {
         return executor.getQueue().size();
     }
 
+    @Override
+    public int queueCapacity() {
+        return properties.shadow().queueSize();
+    }
+
+    @Override
     public int inFlight() {
         return executor.getActiveCount();
     }
 
+    @Override
     public long bytesUsed() {
         return byteBudget.used();
+    }
+
+    @Override
+    public long bytesCapacity() {
+        return byteBudget.capacity();
+    }
+
+    @Override
+    public int workers() {
+        return properties.shadow().workers();
+    }
+
+    @Override
+    public double currentAdmitProbability() {
+        return properties.shadow().sampleRate();
+    }
+
+    @Override
+    public String breakerState() {
+        return "closed";
     }
 
     private boolean sampledIn() {
