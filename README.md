@@ -11,14 +11,11 @@ response or grow the heap without bound.
 
 ## Status
 
-**Design complete, implementation in progress.** This repository currently
-contains the specification in [docs/Objective.md](docs/Objective.md), the design
-reasoning under [docs/plan/](docs/plan/), and the build instructions in
-`docs/implementation-*.md` — one per component, over a shared contract. There is
-no application code yet: the commands, endpoints, and configuration below
-describe the system as designed and specify how it will be set up and run once
-those plans are executed. Nothing here should be read as a description of running
-software.
+The Objective's first implementation is complete: the synchronous primary proxy,
+bounded asynchronous candidate path, deterministic evaluator, live metrics
+endpoint, and GitHub CI/release workflows are implemented and tested. See
+[Limitations and what is not in v1](#limitations-and-what-is-not-in-v1) for the
+features deliberately deferred.
 
 ## How it works
 
@@ -83,10 +80,11 @@ reasoning behind every decision is in [docs/plan/](docs/plan/).
 ## Requirements
 
 - **JDK 21** (LTS). The service targets Java 21 and Spring Boot 4.1.
-- **Docker** with Compose, for the container build and the local stub environment.
 - **Gradle is not required.** The Gradle Wrapper (`./gradlew`) bootstraps a
   pinned, checksum-verified distribution, so a clone builds with nothing but a
   JDK installed.
+- **curl** for the walkthrough below; **jq** is optional but makes metrics easier
+  to inspect.
 
 ## Setup
 
@@ -95,16 +93,13 @@ reasoning behind every decision is in [docs/plan/](docs/plan/).
 The upstream is DigitalOcean Serverless Inference at
 `https://inference.do-ai.run`, whose `POST /v1/chat/completions` endpoint is
 OpenAI-compatible and authenticated with `Authorization: Bearer`. Create a model
-access key for the models you intend to run and export it as
+access key that can call both configured models and export it as
 `DO_INFERENCE_API_KEY`.
 
-[docs/plan/06-production-readiness.md](docs/plan/06-production-readiness.md#credential-handling)
-recommends issuing a **separate model access key per role**, because DigitalOcean
-model access keys are scoped to specific models: that turns quota isolation
-between primary and candidate from an in-process concern into an
-upstream-enforced boundary. Keys are supplied as environment variables from a
-secret store, are never baked into the image or written to disk, and are redacted
-from the startup configuration log.
+The application uses that credential only for outbound DigitalOcean requests; an
+`Authorization` header received from a caller is never forwarded upstream.
+Supply the key from a secret manager in deployment rather than baking it into an
+image or source file.
 
 ### 2. Configure
 
@@ -122,26 +117,21 @@ law rather than chosen.
 | `CANDIDATE_MODEL` | **required** | Model under evaluation |
 | `DO_INFERENCE_BASE_URL` | `https://inference.do-ai.run` | Upstream base URL; pointed at WireMock locally |
 | `SERVER_PORT` | `8080` | Bind port |
-| `MANAGEMENT_SERVER_PORT` | `9090` | Actuator and Prometheus port, not published externally |
+| `MANAGEMENT_SERVER_PORT` | `9090` | Actuator health port, not published externally |
 | `MAX_CONCURRENT_REQUESTS` | `128` | In-flight inbound request cap; beyond it the service returns `503` |
 | `CONNECT_TIMEOUT` | `2s` | Connect timeout for both upstream pools |
 | `PRIMARY_TIMEOUT` | `30s` | Read timeout on the customer path |
 | `SHADOW_TIMEOUT` | `20s` | Read timeout for a candidate call |
-| `UPSTREAM_RPM_LIMIT` | `250` | Documented DigitalOcean default; tiers differ, so it is configuration |
-| `CANDIDATE_QUOTA_SHARE` | `0.4` | Share of upstream quota the shadow path may consume |
-| `SHADOW_QUEUE_SIZE` | `32` | `ArrayBlockingQueue` capacity; the count gate. Held equal to `SHADOW_WORKERS` and under `drain_rate x SHADOW_TASK_TTL`, so a job that is admitted can still be run before it expires |
+| `SHADOW_QUEUE_SIZE` | `32` | `ArrayBlockingQueue` capacity; full queues shed without blocking |
 | `SHADOW_WORKERS` | `32` | Fixed pool size; the cap on concurrent candidate calls |
 | `SHADOW_BUDGET_BYTES` | `8388608` | Byte ceiling on admitted-but-unfinished work; the byte gate |
 | `SHADOW_TASK_TTL` | `30s` | Jobs older than this are dropped at dequeue; the lifetime gate |
-| `SHADOW_SAMPLE_RATE` | `1.0` | Operator ceiling on eligibility; `1.0` mirrors every request |
-| `SHADOW_CONTROL_ARM_RATE` | `0.01` | Fraction of shadow jobs sent to the primary, giving an A/A noise floor |
+| `SHADOW_SAMPLE_RATE` | `1.0` | Independent probability that an eligible request enters the shadow path |
 | `MAX_REQUEST_BYTES` | `131072` | Inbound body cap; exceeding it returns `413` |
 | `MAX_RESPONSE_BYTES` | `262144` | Cap on bytes read from an upstream response |
 | `MAX_EVAL_CONTENT_BYTES` | `32768` | Assistant content retained for comparison |
-| `SHADOW_BREAKER_FAILURE_RATE` | `50` | Candidate circuit breaker failure percentage over a 20-call window |
-| `SHADOW_BREAKER_WAIT` | `60s` | How long the candidate breaker stays open |
 | `SHUTDOWN_GRACE` | `15s` | Grace for in-flight primary requests; the shadow queue is discarded |
-| `ALLOW_AA_MODE` | unset | Permits `PRIMARY_MODEL == CANDIDATE_MODEL`, which otherwise refuses to boot |
+| `ALLOW_AA_MODE` | `false` | Permits `PRIMARY_MODEL == CANDIDATE_MODEL`, which otherwise refuses to boot |
 | `LOG_LEVEL` | `info` | Request and response bodies are never logged at this level |
 
 ### 3. Run
@@ -154,36 +144,43 @@ export CANDIDATE_MODEL=openai-gpt-oss-120b
 ./gradlew bootRun
 ```
 
-## Running with Docker
+The main API listens on `http://localhost:8080`. Health probes are separate:
 
 ```bash
-docker compose up
+curl -s http://localhost:9090/actuator/health
 ```
 
-Compose starts two containers: `proxy`, built from the local multi-stage
-`Dockerfile`, and `mock-inference`, a WireMock stand-in for
-`https://inference.do-ai.run` with configurable latency and failure injection.
-`DO_INFERENCE_BASE_URL` is the only variable that differs between this
-environment and production, which keeps the local demo honest.
+## Step-by-step usage and metrics
 
-This is how load shedding, timeouts, and mismatches are demonstrated **without an
-API key and without spending tokens**. See
-[docs/plan/05-service-topology.md](docs/plan/05-service-topology.md#docker-topology).
+`GET /metric` is read-only. Metrics change when `POST /v1/chat` processes work;
+there is intentionally no endpoint that edits counters directly. Counters are
+local to this process and reset when it restarts.
 
-## API usage
-
-### `POST /v1/chat`
-
-The `model` field in the request is optional and ignored — routing is decided by
-server configuration so that primary and candidate are always compared on
-identical input.
+### 1. Read the baseline
 
 ```bash
-curl -s localhost:8080/v1/chat \
+curl -s http://localhost:8080/metric | jq '{
+  total_requests,
+  shadow,
+  evaluation
+}'
+```
+
+Immediately after startup, counters are zero and live gauges show the configured
+queue, worker, and byte-budget limits.
+
+### 2. Send one customer request
+
+The `model` field is optional and ignored. The service always uses
+`PRIMARY_MODEL` for the synchronous call and `CANDIDATE_MODEL` for the
+asynchronous copy.
+
+```bash
+curl -s http://localhost:8080/v1/chat \
   -H 'Content-Type: application/json' \
   -d '{
     "messages": [
-      {"role": "system", "content": "Reply with JSON: {\"action\": \"...\"}"},
+      {"role": "system", "content": "Reply only with JSON: {\"action\":\"...\"}"},
       {"role": "user", "content": "The user wants to cancel their order."}
     ],
     "temperature": 0,
@@ -192,56 +189,71 @@ curl -s localhost:8080/v1/chat \
 ```
 
 The upstream response is relayed verbatim. Nothing about the shadow evaluation
-appears in it — no extra fields, no extra headers, no added latency.
+appears in it — no extra fields, no extra headers, no candidate latency.
 
-### `GET /metric`
+### 3. Wait for the asynchronous result
+
+The primary response can arrive before the candidate finishes. Poll `completed`
+rather than sleeping for a guessed duration:
 
 ```bash
-curl -s localhost:8080/metric | jq
+until [ "$(curl -s http://localhost:8080/metric | jq '.shadow.completed')" -ge 1 ]; do
+  sleep 0.2
+done
 ```
 
-Abbreviated response; the full field list and the rationale for each field are in
-[docs/plan/02-api-contract.md](docs/plan/02-api-contract.md#get-metric).
+### 4. Inspect what changed
 
-```json
-{
-  "schema_version": "1",
-  "eval_version": "1",
-  "scope": "replica_local",
-  "uptime_seconds": 3600,
-  "total_requests": 1482,
-  "shadow": {
-    "eligible": 1470,
-    "enqueued": 1301,
-    "coverage_pct": 88.50,
-    "shed_total": 169,
-    "shed_by_reason": {
-      "sampled_out": 0, "queue_full": 121, "byte_budget": 8,
-      "breaker_open": 0, "stale_in_queue": 40, "shutting_down": 0
-    },
-    "completed": 1288,
-    "errors": 9,
-    "timeouts": 4,
-    "queue_depth": 12,
-    "queue_capacity": 32,
-    "bytes_used": 61440,
-    "bytes_capacity": 8388608,
-    "breaker_state": "closed"
+```bash
+curl -s http://localhost:8080/metric | jq '{
+  total_requests,
+  shadow: {
+    eligible: .shadow.eligible,
+    enqueued: .shadow.enqueued,
+    coverage_pct: .shadow.coverage_pct,
+    shed_total: .shadow.shed_total,
+    completed: .shadow.completed,
+    errors: .shadow.errors,
+    timeouts: .shadow.timeouts,
+    queue_depth: .shadow.queue_depth,
+    bytes_used: .shadow.bytes_used
   },
-  "evaluation": {
-    "evaluated": 1288,
-    "exact_matches": 1174,
-    "mismatches": 90,
-    "exact_match_rate": 92.88,
-    "exact_match_rate_basis": "exact_matches / (exact_matches + mismatches)",
-    "exact_match_rate_ci95": { "low": 91.30, "high": 94.19, "method": "wilson" }
-  }
-}
+  evaluation
+}'
 ```
 
-`coverage_pct` and the Wilson interval are present because a match rate over 3%
-of traffic and one over 100% look identical without them, and 89% from 50 samples
-is noise while 89% from 50,000 is a fact.
+For a successful primary request, `total_requests` and `shadow.eligible` increase
+immediately. `shadow.enqueued` increases if the job fits the sampling, queue, and
+byte gates. Later, `shadow.completed` and an evaluation verdict increase. A
+candidate timeout or transport failure increments `timeouts` or `errors` instead
+of an evaluation verdict.
+
+`exact_match_rate` uses only exact matches and mismatches as its denominator.
+Malformed or unusable model output is reported separately under
+`primary_unusable`, `candidate_unusable`, `both_unusable`, and
+`unusable_by_reason`. The Wilson interval communicates sample uncertainty.
+
+### 5. Drive several samples
+
+```bash
+for n in $(seq 1 10); do
+  curl -s http://localhost:8080/v1/chat \
+    -H 'Content-Type: application/json' \
+    -d "{
+      \"messages\": [
+        {\"role\":\"system\",\"content\":\"Reply only with JSON: {\\\"action\\\":\\\"...\\\"}\"},
+        {\"role\":\"user\",\"content\":\"Sample request $n: cancel the order\"}
+      ],
+      \"temperature\": 0,
+      \"max_completion_tokens\": 128
+    }" >/dev/null
+done
+
+curl -s http://localhost:8080/metric | jq
+```
+
+Because shadow execution is asynchronous, `eligible` may briefly be greater than
+the number of terminal outcomes. Re-read after the workers drain.
 
 ## How this bounds the memory footprint
 
@@ -251,11 +263,11 @@ state is a product of configured constants, not of traffic.** No amount of
 inbound load changes the ceiling; it only changes how much work is discarded to
 stay under it.
 
-Five mechanisms combine to make that true.
+Several independent limits combine to make that true.
 
 **The shadow queue is bounded twice.** `SHADOW_QUEUE_SIZE` is the capacity of an
-`ArrayBlockingQueue` allocated once at startup, so at most that many jobs are
-retained — notably *not* the unbounded `LinkedBlockingQueue` that
+`ArrayBlockingQueue` allocated once at startup, so at most that many jobs wait in
+the queue — notably *not* the unbounded `LinkedBlockingQueue` that
 `Executors.newFixedThreadPool` would have supplied, which would let a backlog
 grow until `OutOfMemoryError`. A count gate alone still permits a large swing in
 footprint depending on payload size, so a second gate bounds the actual bytes:
@@ -272,17 +284,11 @@ Shedding is a normal outcome, so it increments a counter and returns.
 Backpressure is absorbed by dropping work rather than by parking request threads
 that each keep a request body reachable.
 
-**Dropping is uniform random, so the sample stays unbiased.** A queue that simply
-drops whatever arrives once it is full admits jobs from the *beginning* of every
-burst and rejects the *tail*. Bursts are not random samples of production
-traffic — they line up with peak hours, retry storms, and individual heavy
-customers — so tail-dropping systematically skews the surviving sample and turns
-`exact_match_rate` into a biased estimator of the very number this service exists
-to report, while the figure still looks perfectly precise. Admission is therefore
-uniform random against a probability recomputed once a second,
-`min(1, sustainable_drain_rate / ewma(arrival_rate))`, floored so measurement
-never stops entirely. Under a 50x burst roughly 98% of shadow jobs are dropped,
-but dropped at random, so the match rate remains a valid estimator.
+**Sampling happens before allocation.** When `SHADOW_SAMPLE_RATE` is below `1.0`,
+an independent random draw rejects work before reserving bytes or touching the
+queue. At the default `1.0`, every eligible request is attempted; overload is
+then shed by the byte-budget or queue-capacity gates. Adaptive admission is not
+implemented in this version.
 
 **Worker concurrency is fixed.** `SHADOW_WORKERS` platform threads, pre-sized and
 never growing, cap the number of concurrent candidate calls, candidate
@@ -309,24 +315,29 @@ and returns `503` with `Retry-After` immediately beyond it.
 
 ```
 reservation_i     =  len(requestBody) + len(primaryContent) + overhead
-                  <= MAX_REQUEST_BYTES + MAX_EVAL_CONTENT_BYTES + 512 B
+                  <= MAX_REQUEST_BYTES + MAX_RESPONSE_BYTES + 512 B
 
 invariant (CAS)   :  sum(reservation_i) <= SHADOW_BUDGET_BYTES
                      over every admitted-but-not-yet-completed job
 
-peak heap        ~=  MAX_CONCURRENT_REQUESTS x (MAX_REQUEST_BYTES + MAX_RESPONSE_BYTES)
-                   + SHADOW_BUDGET_BYTES
+admitted jobs     <= SHADOW_QUEUE_SIZE + SHADOW_WORKERS
+
+bounded state     <= MAX_CONCURRENT_REQUESTS x (MAX_REQUEST_BYTES + MAX_RESPONSE_BYTES)
+                   + min(
+                       SHADOW_BUDGET_BYTES,
+                       admitted jobs x reservation_i
+                     )
                    + SHADOW_WORKERS x (MAX_RESPONSE_BYTES + per-thread overhead)
 ```
 
 At the documented defaults:
 
 ```
-inbound   :  128 x (128 KiB + 256 KiB)  =  48 MiB
-shadow    :  SHADOW_BUDGET_BYTES        =   8 MiB
-in-flight :   32 x 256 KiB              =   8 MiB
-                                          --------
-application-controlled state           ~=  65 MB
+inbound primary buffers : 128 x (128 KiB + 256 KiB) = 48 MiB
+retained shadow jobs    : SHADOW_BUDGET_BYTES       =  8 MiB
+candidate responses     :  32 x 256 KiB             =  8 MiB
+                                                        ------
+application-controlled state                         ~= 64 MiB
 ```
 
 Every term is a configured constant. There is no traffic-dependent term anywhere
@@ -334,7 +345,7 @@ in it.
 
 ### The honest caveat
 
-Application-controlled state is bounded at roughly **65 MB**, but on the JVM the
+Application-controlled state is bounded at roughly **64 MiB**, but on the JVM the
 **baseline footprint dominates the total**: heap reserve, metaspace, code cache,
 thread stacks, and GC structures are typically **150–250 MB** before the
 application stores a single byte. The formula above genuinely bounds the part of
@@ -350,34 +361,20 @@ cannot push you past that limit, not as the number you size to. Derivation in
 ## Testing
 
 ```bash
-./gradlew build                  # spotless, ArchUnit, unit and integration tests, assemble
-./gradlew test integrationTest   # the suites individually
-./gradlew spotlessApply          # format
+./gradlew test
+./gradlew clean check bootJar
 ```
 
 Unit and integration tests cover the evaluator's rules, the byte-budget invariant
-under concurrent admission, burst behaviour against a size-2 queue, and the chaos
-cases (candidate 500, candidate hang past timeout, candidate non-JSON, candidate
-`429`, primary failure with a healthy candidate). An ArchUnit rule fails the build
-if anything under `shadow` or `eval` imports `jakarta.servlet` or
-`org.springframework.web`, making the isolation guarantee structural rather than
-reviewed.
-
-The latency-isolation claim is **not** asserted by a unit test. It is proven by a
-k6 load gate in `perf/`, which runs the same load twice — once with a healthy
-candidate, once with the candidate stub injected at 30s latency and a 100% error
-rate — and compares the whole primary-latency distributions with a two-sample
-Kolmogorov–Smirnov test rather than a single percentile, because shadow
-interference would most plausibly appear as a fattened tail. A non-vacuity gate
-asserts `shadow_shed_total > 0`, so the test cannot pass by never stressing the
-path it claims to certify. Details in
-[docs/plan/06-production-readiness.md](docs/plan/06-production-readiness.md#proving-the-isolation-claim).
+under concurrent admission, non-blocking queue shedding, primary response
+fidelity, asynchronous candidate routing, inbound size/concurrency limits, and
+metrics reconciliation and serialization.
 
 ## Project layout
 
 ```
 .
-├── gradlew, gradle/            Gradle Wrapper, version catalog, dependency verification
+├── gradlew, gradle/            pinned Gradle Wrapper
 ├── build.gradle.kts, settings.gradle.kts
 ├── src/main/java/com/example/shadowproxy/
 │   ├── config/                 validated properties, RestClient beans, bounded executor
@@ -387,11 +384,9 @@ path it claims to certify. Details in
 │   ├── eval/                   deterministic evaluator, pure and stateless
 │   ├── metrics/                LongAdder registry, snapshot, MetricController
 │   └── web/                    concurrency cap, request id, request size limit filters
-├── src/test/java/...           unit, integration, and ArchUnit suites
-├── perf/                       k6 latency-isolation load gate
+├── src/test/java/...           unit and integration tests
 ├── docs/                       Objective, architecture diagrams, plan
-├── .github/workflows/ci.yml
-├── Dockerfile, docker-compose.yaml
+├── .github/workflows/          CI and tagged release pipelines
 └── README.md
 ```
 
@@ -414,14 +409,18 @@ path it claims to certify. Details in
 - **Metrics are per-replica and reset on restart.** Counters are in-process
   `LongAdder` values, so `/metric` reports one replica's view — `scope` and
   `replica_id` say so in the payload — and history does not survive a restart.
-  The Objective asks for a real-time summary, not durable history; cross-replica
-  aggregation is Prometheus's job via the separate management port.
+  The Objective asks for a real-time summary, not durable history; fleet
+  aggregation requires an external collector.
 - **No persistence of mismatched payloads and no runtime `PUT /config`.** Both
   are listed under "Next" in [docs/Objective.md](docs/Objective.md) rather than in
   v1 scope.
 - **Evaluation is deterministic, not semantic.** The heuristic compares one string
   field. It answers "does the candidate choose the same action" and nothing about
   response quality.
+- **Adaptive admission, a candidate circuit breaker, and the A/A control arm are
+  not implemented yet.** This version uses the static `SHADOW_SAMPLE_RATE`, then
+  sheds at the byte and queue gates. The related plan sections describe future
+  hardening, not current runtime behavior.
 
 ## Documentation
 
@@ -434,7 +433,6 @@ path it claims to certify. Details in
 - [docs/implementation-contracts.md](docs/implementation-contracts.md) — the frozen cross-component types, the config surface, and the build order.
 - [docs/implementation-api-proxy.md](docs/implementation-api-proxy.md) — `POST /v1/chat`, the upstream client, the servlet filters.
 - [docs/implementation-eval-shadow.md](docs/implementation-eval-shadow.md) — admission, the bounded executor, the candidate call, the evaluator.
-- [docs/implementation-metrics.md](docs/implementation-metrics.md) — the counter registry, the snapshot, `GET /metric`.
 
 **Design reasoning**, kept as the record of how the above was arrived at:
 
