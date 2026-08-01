@@ -107,6 +107,13 @@ is copied into an immutable `ShadowJob` record at submit time. This is the Java
 equivalent of detaching the background work from the request context, and it is
 the single most likely place to introduce a subtle bug.
 
+Rather than rely on review to catch that, the isolation is made **structurally
+unrepresentable**: `ShadowJob` has no field capable of referencing the request,
+`ShadowDispatcher.submit` takes no servlet type, and an ArchUnit test fails the
+build if anything under `shadow` or `eval` imports `jakarta.servlet` or
+`org.springframework.web`. A reviewer can then verify the guarantee by reading a
+record definition instead of tracing call paths.
+
 ### Primary path
 
 `InferenceClient` wraps a Spring `RestClient` pointed at
@@ -134,19 +141,65 @@ new ThreadPoolExecutor(
     0L, TimeUnit.MILLISECONDS,
     new ArrayBlockingQueue<>(queueSize),    // bounded: the memory ceiling
     new ShadowThreadFactory(),              // named, daemon threads
-    (job, executor) -> metrics.shadowShed.increment());  // shed, do not block
+    (job, executor) -> metrics.recordShed(QUEUE_FULL));  // shed, do not block
 ```
 
-The `RejectedExecutionHandler` is the whole load-shed policy in one line. It is
-deliberately not `CallerRunsPolicy` — that would run the candidate call *on the
-request thread* and hand the customer the candidate's latency, defeating the
-entire design. It is also not `AbortPolicy`, which would make shedding an
-exception in the request path; shedding is a normal outcome, so it just bumps a
-counter and returns.
+The `RejectedExecutionHandler` is deliberately not `CallerRunsPolicy` — that
+would run the candidate call *on the request thread* and hand the customer the
+candidate's latency, defeating the entire design. It is also not `AbortPolicy`,
+which would make shedding an exception in the request path; shedding is a normal
+outcome, so it bumps a counter and returns.
 
-Under a traffic burst the queue fills, excess jobs are dropped, and the primary
-path keeps running at full speed. Shedding is reported through `GET /metric` so
-the sampling gap is visible rather than silent.
+That handler is the last line of defence, not the policy. The policy is below.
+
+### Load shedding, and why it is not just "drop when full"
+
+The obvious design is a bounded queue that drops whatever arrives once it is
+full. That satisfies the Objective's wording. It also **quietly biases the one
+number this service exists to produce.**
+
+A FIFO that drops on overflow admits jobs from the *beginning* of each burst and
+rejects the *tail*. Bursts are not random samples of production traffic — they
+line up with peak hours, retry storms, and individual heavy customers. So the
+surviving sample is systematically skewed toward whatever kind of request starts
+a burst, and `exact_match_rate` computed over it is a biased estimator of the
+true match rate. The failure is invisible: the number still looks precise, and
+nothing in the metrics hints that it is wrong.
+
+So admission is **uniform random** instead:
+
+```
+p_admit = min(1, sustainable_drain_rate / ewma(arrival_rate))
+```
+
+recomputed once a second and floored at 1% so measurement never stops entirely.
+Under a 50x burst roughly 98% of shadow jobs are dropped, but dropped *at
+random*, so the surviving sample stays representative and the match rate remains
+a valid estimator of the true rate.
+
+Three hard gates sit behind the sampler, each closing a different leak:
+
+1. **Count gate** — `SHADOW_QUEUE_SIZE`, the `ArrayBlockingQueue` capacity.
+   Bounds the number of retained jobs.
+2. **Byte-budget gate** — `SHADOW_BUDGET_BYTES`, an `AtomicLong` reserved with a
+   compare-and-set loop so the budget is never exceeded even transiently.
+   The count gate alone permits a large swing in footprint depending on payload
+   size; this gate bounds the actual bytes.
+3. **Task TTL** — `SHADOW_TASK_TTL`. Checked at dequeue, before the candidate is
+   called. A bounded queue with unbounded item *lifetime* still leaks, because a
+   handful of slow tasks pin their reservations indefinitely.
+
+The queue is deliberately **shallow**. At a sustainable drain of a couple of jobs
+per second, a 256-deep queue would take minutes to drain — far longer than the
+TTL — so everything past the first few dozen entries would expire unprocessed. A
+deep queue is not burst absorption, it is a bias reservoir that holds memory and
+throws the samples away later. Random admission absorbs burst; the queue only
+smooths sub-second jitter.
+
+Every drop is attributed to a specific cause — `sampled_out`, `queue_full`,
+`byte_budget`, `breaker_open`, `stale_in_queue`, `shutting_down` — because
+"deliberate cost control" and "we are overloaded" demand opposite responses from
+an operator.
 
 ### Worker pool
 
@@ -203,13 +256,28 @@ state is a small fixed-size object regardless of traffic volume.
 This is the section the Objective explicitly asks the README to carry; the
 reasoning lives here and the README summarises it.
 
-Peak retained shadow state is a product of two configured constants, not of
-traffic:
+Peak retained shadow state is a product of configured constants, not of traffic.
+The byte budget makes it an explicit ceiling rather than an inference from the
+job count:
 
 ```
-peak shadow heap  ~=  (SHADOW_QUEUE_SIZE + SHADOW_WORKERS) x bytes_per_job
-bytes_per_job     ~=  request body + captured primary output
+reservation_i     =  len(requestBody) + len(primaryContent) + overhead
+                  <= MAX_REQUEST_BYTES + MAX_EVAL_CONTENT_BYTES + 512 B
+
+invariant (CAS)   :  sum(reservation_i) <= SHADOW_BUDGET_BYTES
+                     over every admitted-but-not-yet-completed job
+
+peak shadow heap  ~=  SHADOW_BUDGET_BYTES
+                    + SHADOW_WORKERS x (MAX_RESPONSE_BYTES + per-thread overhead)
 ```
+
+A reservation is taken at admission and released only when the task finishes, so
+it covers queued *and* in-flight work in one term. The three leak vectors of an
+in-process queue are each closed by a named constant: unbounded queue growth by
+the count and byte gates, unbounded item size by `MAX_REQUEST_BYTES` and
+`MAX_RESPONSE_BYTES`, and unbounded item lifetime by `SHADOW_TASK_TTL` plus the
+per-task timeout. The third is the one usually forgotten, and it is sufficient on
+its own to turn a "bounded" queue into a leak.
 
 Bounding the shadow path is necessary but not sufficient. Inbound concurrency is
 capped separately at `MAX_CONCURRENT_REQUESTS`, because virtual threads impose no
@@ -231,13 +299,20 @@ Three properties combine to make that a real ceiling:
 3. **Concurrency is fixed.** `SHADOW_WORKERS` threads means at most that many
    candidate responses are buffered at once, no matter the arrival rate.
 
-With defaults of `SHADOW_QUEUE_SIZE=256`, `SHADOW_WORKERS=8`, and a conservative
-32 KB per job, the shadow subsystem's ceiling is roughly 8 MB of live data. We
-additionally cap inbound bodies at `MAX_REQUEST_BYTES` with a servlet filter and
-cap the candidate response read, so a single oversized payload cannot inflate
-`bytes_per_job`. Each `ShadowJob` is a record of immutable `byte[]` references
-that becomes unreachable the moment its task finishes, so the garbage collector
-reclaims it promptly rather than at some later checkpoint.
+At the defaults in [04-operations.md](04-operations.md#configuration) the shadow
+subsystem's ceiling is 8 MB of budgeted job data plus roughly 8 MB of in-flight
+response buffers. Inbound bodies are capped by a servlet filter and candidate
+responses by a bounded read, so a single oversized payload cannot inflate a
+reservation. Each `ShadowJob` is a record of immutable `byte[]` references that
+becomes unreachable the moment its task completes.
+
+**An honest caveat specific to the JVM.** Application-controlled state is bounded
+at roughly 65 MB, but JVM baseline footprint — heap reserve, metaspace, code
+cache, thread stacks, GC structures — is typically 150–250 MB and therefore
+*dominates* the total. The formula above genuinely bounds the part of memory this
+design controls; it does not make the container small. Size the container from
+[06-production-readiness.md](06-production-readiness.md#capacity-and-deployment)
+rather than from the formula alone.
 
 The failure mode we are explicitly designing out is the naive
 `@Async` or `CompletableFuture.runAsync(...)` per request on a default executor.

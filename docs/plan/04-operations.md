@@ -12,13 +12,9 @@ Environment variables are referenced through explicit `${...}` placeholders in
 - `SERVER_PORT` — bind port. Default `8080`.
 - `MANAGEMENT_SERVER_PORT` — Actuator and Prometheus port, not published
   externally. Default `9090`.
-- `PROXY_API_KEYS` — **required**. Comma-separated keys accepted on inbound
-  requests. See
-  [06-production-readiness.md](06-production-readiness.md#inbound-authentication).
-- `MAX_CONCURRENT_REQUESTS` — default `200`. In-flight request cap; beyond it the
-  service returns `503` immediately rather than accumulating request state.
-- `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` — per-key token bucket. Defaults `50`
-  and `100`.
+- `MAX_CONCURRENT_REQUESTS` — default `128`, derived below rather than chosen.
+  In-flight request cap; beyond it the service returns `503` immediately rather
+  than accumulating request state.
 - `CONNECT_TIMEOUT` — default `2s`, applied to both upstream pools and distinct
   from the read timeouts below.
 - `DO_INFERENCE_API_KEY` — **required**. Bearer token for DigitalOcean
@@ -28,20 +24,36 @@ Environment variables are referenced through explicit `${...}` placeholders in
 - `PRIMARY_MODEL` — **required**. Model serving customer traffic, e.g.
   `llama3.3-70b-instruct`.
 - `CANDIDATE_MODEL` — **required**. Model under evaluation.
+- `UPSTREAM_RPM_LIMIT` — default `250`, matching DigitalOcean's documented
+  default. Serverless tiers differ (Tier 1 is 120 RPM, Tier 5 is 4,500), so this
+  is configuration, and the pool sizes below are derived from it.
+- `CANDIDATE_QUOTA_SHARE` — default `0.4`. Fraction of the upstream request
+  budget the shadow path may consume. The primary is never client-side throttled.
 - `PRIMARY_TIMEOUT` — default `30s`. Read timeout on the customer path.
 - `SHADOW_TIMEOUT` — default `20s`. Read timeout for a candidate call; exceeding
   it counts as `shadow_timeouts`.
-- `SHADOW_QUEUE_SIZE` — default `256`. `ArrayBlockingQueue` capacity; the primary
-  lever on the shadow memory ceiling.
-- `SHADOW_WORKERS` — default `8`. Fixed pool size; the cap on concurrent
+- `SHADOW_QUEUE_SIZE` — default `32`. `ArrayBlockingQueue` capacity. Deliberately
+  shallow, and derived below rather than chosen; see
+  [01-architecture.md](01-architecture.md#load-shedding-and-why-it-is-not-just-drop-when-full).
+- `SHADOW_WORKERS` — default `32`. Fixed pool size; the cap on concurrent
   candidate calls.
-- `SHADOW_SAMPLE_RATE` — default `1.0`, meaning every request is shadowed, as the
-  Objective specifies. Lower it to trade sample size for candidate token spend;
-  sampled-out requests are reported as `shadow_sampled_out`, never as
-  `shadow_shed`.
-- `MAX_REQUEST_BYTES` — default `1048576` (1 MB). Enforced by
-  `RequestSizeLimitFilter`; also caps per-job memory.
-- `MAX_RESPONSE_BYTES` — default `1048576`. Cap on upstream response reads.
+- `SHADOW_BUDGET_BYTES` — default `8388608` (8 MiB). Hard byte ceiling on
+  admitted-but-unfinished shadow work, reserved with a compare-and-set loop.
+- `SHADOW_TASK_TTL` — default `30s`. Jobs older than this are dropped at dequeue
+  as `stale_in_queue` rather than spending upstream quota on a stale sample.
+- `SHADOW_SAMPLE_RATE` — default `1.0`, meaning every request is eligible, as the
+  Objective specifies. This is the operator-set ceiling; the adaptive admission
+  probability in [01-architecture.md](01-architecture.md#load-shedding-and-why-it-is-not-just-drop-when-full)
+  may drop below it under burst, and the two are reported separately.
+- `SHADOW_CONTROL_ARM_RATE` — default `0.01`. Fraction of shadow jobs sent to the
+  **primary** model instead of the candidate, establishing the A/A noise floor.
+- `MAX_REQUEST_BYTES` — default `131072` (128 KiB). Enforced by
+  `RequestSizeLimitFilter`; also caps a job's byte reservation.
+- `MAX_RESPONSE_BYTES` — default `262144` (256 KiB). Cap on upstream response
+  reads.
+- `MAX_EVAL_CONTENT_BYTES` — default `32768` (32 KiB). Cap on the assistant
+  content retained for comparison; an `{"action": "..."}` payload is under 1 KiB,
+  so this is ample headroom.
 - `SHADOW_BREAKER_FAILURE_RATE` / `SHADOW_BREAKER_WAIT` — candidate circuit
   breaker. Defaults `50` percent over a 20-call window, opening for `60s`.
 - `SHUTDOWN_GRACE` — default `15s`. In-flight primary requests finish; the shadow
@@ -51,30 +63,72 @@ Environment variables are referenced through explicit `${...}` placeholders in
 
 Validation rules: timeouts must be positive, `SHADOW_WORKERS` must be at least 1,
 `SHADOW_QUEUE_SIZE` must be at least as large as `SHADOW_WORKERS`,
-`SHADOW_SAMPLE_RATE` must be within `0.0`–`1.0`, and both
-`DO_INFERENCE_API_KEY` and `PROXY_API_KEYS` must be non-blank. Secrets are
-redacted in the startup configuration log.
+`SHADOW_SAMPLE_RATE` must be within `0.0`–`1.0`, and `DO_INFERENCE_API_KEY` must
+be non-blank. Secrets are redacted in the startup configuration log.
+
+### Deriving the concurrency constants
+
+These defaults are derived, not guessed, and should be re-derived rather than
+nudged when the upstream limit changes.
+
+The binding constraint is upstream request quota, not CPU. At the documented
+default of 250 requests/minute shared across both models, total sustainable
+throughput is about 4.2 requests/second. Little's law (`L = λ × W`) then gives
+the two pool sizes:
+
+```
+MAX_CONCURRENT_REQUESTS  = 4.2 req/s  x 30s primary timeout  ~= 126  -> 128
+candidate share          = 4.2 req/s  x 0.4                   ~= 1.7 req/s
+SHADOW_WORKERS           = 1.7 req/s  x 20s shadow timeout    ~=  34  ->  32
+```
+
+Queue depth follows from drain rate and TTL, not from a round number. Anything
+deeper than `drain_rate × SHADOW_TASK_TTL` is guaranteed to hold jobs that will
+expire before they are ever processed, which is memory spent to produce nothing.
+That ceiling and the `SHADOW_QUEUE_SIZE >= SHADOW_WORKERS` validation rule bracket
+the depth from both sides:
+
+```
+floor (validation)  = SHADOW_WORKERS                          =  32
+ceiling (usefulness)= 1.7 jobs/s x 30s SHADOW_TASK_TTL        ~=  51
+SHADOW_QUEUE_SIZE   = 32, draining in ~19s, comfortably inside the TTL
+```
+
+The TTL is set to `30s` rather than something tighter so the ceiling clears the
+floor at all: at a `15s` TTL the ceiling would be about 26 jobs, below the
+32-worker floor, and every legal queue depth would then be one that admits jobs
+destined to expire unprocessed.
+
+Two consequences worth internalising. First, **one replica saturates the entire
+account quota**, so additional replicas buy availability, not throughput. Second,
+the candidate is throttled and the primary never is: spending customer-facing
+capacity to feed a measurement system would invert the priorities.
 
 ### Tuning guidance
 
-`SHADOW_QUEUE_SIZE` and `SHADOW_WORKERS` are the two knobs that set both the
-memory ceiling and the sampling coverage. Raising them samples more traffic at
-the cost of heap and upstream pressure; lowering them sheds more. If
-`shadow_shed` is persistently high and the candidate endpoint has headroom, raise
-workers first, then queue size. If `shadow_errors` is dominated by `429`, lower
-workers — the fix is less concurrency, not more retries. Neither knob affects
-primary latency.
+`SHADOW_WORKERS` and `CANDIDATE_QUOTA_SHARE` set sampling coverage; the queue and
+byte budget set the memory ceiling. If `coverage_pct` is low while the candidate
+endpoint has headroom, raise the quota share and re-derive workers. If
+`shadow_errors` is dominated by `429`, lower the quota share — the fix is less
+concurrency, not more retries, and sustained failures will trip the breaker
+anyway. None of these knobs affects primary latency.
+
+Watch `shed_by_reason` rather than the shed total: `sampled_out` means the
+adaptive governor is working as designed, `queue_full` and `byte_budget` mean the
+hard gates are binding, and `stale_in_queue` means the queue is deeper than the
+drain rate justifies.
 
 ## Local development
 
-No Maven install is required; the wrapper bootstraps it.
+No Gradle install is required; the wrapper bootstraps a pinned, checksum-verified
+distribution.
 
 ```bash
 export DO_INFERENCE_API_KEY=...
 export PRIMARY_MODEL=llama3.3-70b-instruct
 export CANDIDATE_MODEL=openai-gpt-oss-120b
 
-./mvnw spring-boot:run
+./gradlew bootRun
 ```
 
 To run against the WireMock stub instead of the real endpoint — which is how the
@@ -84,15 +138,16 @@ tokens — use `docker compose up`, described in
 
 ```bash
 curl -s localhost:8080/v1/chat \
-  -H 'Authorization: Bearer $PROXY_API_KEY' \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Reply with {\"action\":\"refund\"}"}]}'
 
-curl -s localhost:8080/metric -H "Authorization: Bearer $PROXY_API_KEY" | jq
+curl -s localhost:8080/metric | jq
 ```
 
-Other useful commands: `./mvnw verify` for the full test suite, `./mvnw spotless:apply`
-to format.
+Other useful commands: `./gradlew build` for the full check-and-assemble cycle,
+`./gradlew test integrationTest` for the suites individually, and
+`./gradlew spotlessApply` to format. The build enables the configuration cache
+and Gradle's build cache, so incremental runs stay fast.
 
 ## CI/CD
 
@@ -101,18 +156,22 @@ GitHub Actions at `.github/workflows/ci.yml`, triggered on push and pull request
 ```mermaid
 flowchart LR
   Push([push / PR]) --> Checkout
-  Checkout --> Setup["setup-java: Temurin 21 + Maven cache"]
-  Setup --> Format["spotless:check"]
-  Setup --> Verify["./mvnw verify (unit + integration)"]
-  Format --> Package["./mvnw package"]
+  Checkout --> Setup["setup-java Temurin 21 + gradle/actions/setup-gradle"]
+  Setup --> Format["spotlessCheck"]
+  Setup --> Arch["archTest: isolation rules"]
+  Setup --> Verify["./gradlew build (unit + integration)"]
+  Format --> Package["./gradlew bootJar"]
+  Arch --> Package
   Verify --> Package
   Package --> Image["docker build"]
 ```
 
-Gates: the format check and the full `verify` phase must pass before packaging.
-The image build runs on every branch to catch Dockerfile breakage early;
-publishing is limited to the default branch. Maven dependency caching is handled
-by `actions/setup-java` with `cache: maven`.
+Gates: formatting, the ArchUnit isolation rules, and the full test suite must all
+pass before the jar is assembled. The image build runs on every branch to catch
+Dockerfile breakage early; publishing is limited to the default branch.
+Dependency and build-output caching is handled by `gradle/actions/setup-gradle`,
+with the configuration cache enabled and dependency verification checked against
+`gradle/verification-metadata.xml`.
 
 The image is then scanned with Trivy and an SBOM is attached, and the load test
 that proves the latency-isolation claim runs nightly rather than per pull
@@ -121,18 +180,21 @@ request. Both are specified in
 
 ## Container
 
-Multi-stage `Dockerfile`. The build stage runs `./mvnw dependency:go-offline`
-before copying sources, so dependency resolution is cached independently of code
-changes; the runtime stage is `eclipse-temurin:21-jre` running as a non-root
-user, exposing the configured port, with a healthcheck against
-`/actuator/health`.
+Multi-stage `Dockerfile`. The build stage resolves dependencies before copying
+sources so resolution is cached independently of code changes, then the Spring
+Boot **layered jar** is extracted so dependencies, loader, and application
+classes land in separate image layers — a code-only change then rebuilds a few
+hundred kilobytes instead of the whole fat jar. The runtime stage is
+`eclipse-temurin:21-jre` pinned by digest, running as a non-root user, exposing
+the configured port, with a healthcheck against `/actuator/health`.
 
-Set `-XX:MaxRAMPercentage=75` and let the JVM size the heap from the container
-limit rather than hard-coding `-Xmx`. Because the shadow subsystem has a fixed
-ceiling, sizing is predictable: set the container limit above the computed
-ceiling from
+Set `-XX:MaxRAMPercentage=70` and let the JVM size the heap from the container
+limit rather than hard-coding `-Xmx`. The bounded terms in
 [01-architecture.md](01-architecture.md#how-this-bounds-the-memory-footprint)
-plus normal JVM overhead (metaspace, code cache, thread stacks).
+guarantee that load cannot push the application past its ceiling, but on the JVM
+they do not determine the container size — baseline footprint does. Use the
+768 MB figure derived in
+[06-production-readiness.md](06-production-readiness.md#capacity-and-deployment).
 
 ## Observability
 

@@ -20,22 +20,6 @@ earlier drafts of this plan rather than additions:
 
 ## Security
 
-### Inbound authentication
-
-`POST /v1/chat` proxies to a metered, paid upstream. Left open, anyone who can
-reach the port can spend your inference budget. The service requires a bearer
-token on every route:
-
-- `PROXY_API_KEYS` — comma-separated set of accepted keys, compared with
-  `MessageDigest.isEqual` to avoid a timing side channel.
-- Missing or unknown key returns `401` with no detail about why.
-- `GET /metric` requires the same key. It exposes request volume, error rates,
-  and candidate match quality — competitive and operational signal that does not
-  belong on an open port. The Objective's endpoint and payload are unchanged;
-  only the auth requirement is added.
-- `/actuator/health` stays unauthenticated so orchestrator probes work, and
-  exposes no detail beyond status.
-
 ### Credential handling
 
 The client's `Authorization` header is consumed by us and **never forwarded
@@ -48,6 +32,13 @@ Keys come from the orchestrator's secret store as environment variables. They ar
 never baked into the image, never written to disk, and never appear in
 `docker-compose.yaml` outside the local mock profile.
 
+**Use separate model access keys for the primary and the candidate.**
+DigitalOcean model access keys are scoped to specific models, so issuing one per
+role turns quota isolation from an in-process concern into an upstream-enforced
+boundary: a runaway shadow path physically cannot consume the primary's quota,
+even if our own throttle has a bug. Enforcing an invariant in the system that
+owns the resource beats enforcing it in the system that consumes it.
+
 ### Prompt data
 
 Request bodies contain customer prompts and are likely to contain personal data.
@@ -59,19 +50,49 @@ persisted anywhere.
 Candidate calls carry `X-Shadow-Request: true` so mirrored traffic is
 distinguishable in any upstream logging or billing breakdown.
 
-### Rate limiting
+### Deferred: inbound authentication and rate limiting
 
-Per-key token bucket via Bucket4j, `RATE_LIMIT_RPS` default `50` with a burst of
-`RATE_LIMIT_BURST` default `100`. Exceeding it returns `429` with `Retry-After`.
-This protects both our budget and the upstream quota from a single misbehaving
-client.
+**Not in v1 scope.** The service ships with no inbound authentication and no
+per-key rate limiter. The design is recorded here rather than dropped, so that
+whoever picks it up does not have to rediscover the argument, and so the gap is
+visible instead of implicit. **Until this ships, the service must not be exposed
+to an untrusted network** — put it behind a gateway or a private network
+boundary.
+
+The reasoning is unchanged by the deferral. `POST /v1/chat` fronts a metered,
+paid upstream, so anyone who can reach the port can spend the inference budget.
+`GET /metric` exposes request volume, error rates, and candidate match quality —
+competitive and operational signal that does not belong on an open port.
+
+What we would build:
+
+- **A bearer token on every route.** `PROXY_API_KEYS`, a comma-separated set of
+  accepted keys, compared with `MessageDigest.isEqual` to avoid a timing side
+  channel, enforced by an `ApiKeyAuthFilter` ordered ahead of any real work. A
+  missing or unknown key returns `401` with no detail about why.
+- **A per-key token bucket** via Bucket4j in a `RateLimitFilter`,
+  `RATE_LIMIT_RPS` default `50` with a burst of `RATE_LIMIT_BURST` default
+  `100`, returning `429` with `Retry-After`. It protects both our budget and the
+  upstream quota from a single misbehaving client. Because the bucket is keyed by
+  API key, it is meaningless without keys and therefore parks together with
+  authentication rather than shipping alone.
+- `/actuator/health` would stay unauthenticated so orchestrator probes keep
+  working, exposing no detail beyond status.
+
+The Objective's endpoint paths and payloads are unaffected either way: this was
+always an additional requirement layered on top of them, never a change to them.
+
+Two nearby mechanisms are **not** parked and should not be confused with this
+one. `MAX_CONCURRENT_REQUESTS` and its `503` are an inbound memory bound rather
+than an access control, and the handling of `429` responses *from DigitalOcean*
+is about respecting an upstream quota, not about limiting our own callers.
 
 ## Reliability
 
 ### Bounded inbound concurrency
 
 A semaphore filter caps concurrent in-flight requests at
-`MAX_CONCURRENT_REQUESTS`, default `200`. Beyond that the service returns `503`
+`MAX_CONCURRENT_REQUESTS`, default `128`. Beyond that the service returns `503`
 with `Retry-After` immediately rather than accumulating request state. This
 closes the inbound half of the memory story:
 
@@ -95,6 +116,24 @@ Two `HttpClient` instances with independent pools:
 
 Shadow traffic cannot exhaust, block on, or evict connections belonging to the
 customer path.
+
+### Retries, and where they are forbidden
+
+Exactly one retry on the primary path, and only when the connection failed before
+any request bytes reached the server — a dial or TLS handshake failure, after a
+short jittered backoff. **Never retry once the body has been sent.** Inference
+calls are billed and non-idempotent, so a speculative retry on an ambiguous
+timeout risks double-charging the customer and double-counting tokens, which is
+worse than returning a `502`.
+
+The shadow path never retries at all. Retrying a best-effort sample under
+rate-limit pressure makes the pressure worse; the correct response is to shed.
+
+On upstream `429`, follow DigitalOcean's documented guidance rather than a
+generic backoff: read the soonest non-zero `x-ratelimit-reset-*` header to find
+the binding limit, prefer `Retry-After` when present, wait at least one second
+with 250–500 ms of jitter, and treat a `reset: 0` after rejection as ambiguous
+rather than as permission to retry immediately.
 
 ### Circuit breaker on the candidate
 
@@ -174,9 +213,23 @@ worth measuring rather than asserting.
 
 A k6 scenario in `perf/` runs a fixed load against the service twice: once with a
 healthy candidate, once with the candidate stub injected at 30s latency and a
-100% error rate. The gate is that **primary p99 differs by less than 5% between
-the two runs**, with `shadow_shed` demonstrating that shedding engaged. This runs
-nightly in CI, not on every pull request.
+100% error rate. Three gates, all of which must hold:
+
+1. **Distribution, not just a percentile.** A two-sample Kolmogorov–Smirnov test
+   over the primary latency samples from both runs, failing if the distributions
+   differ significantly *and* p99 moves by more than 5%. Shadow interference
+   would most plausibly appear as a fattened tail, which comparing means or even
+   a single percentile can miss entirely.
+2. **Peak RSS in the degraded run** stays under the container limit.
+3. **`shadow_shed_total > 0`.** This gate is not optional. Without it the test
+   passes vacuously whenever the load generator is too weak to cause shedding,
+   and you would be certifying a code path that never executed. Every load test
+   needs an assertion that the thing under stress was actually stressed.
+
+An honest limitation: this bounds the effect size, it does not prove zero. That
+is why the structural guarantees come first — `ShadowJob` holding no reference to
+the request, and the ArchUnit rules enforcing it, are proofs; this is
+corroboration under realistic conditions.
 
 Chaos cases covered in integration tests: candidate returns 500, candidate hangs
 past timeout, candidate returns non-JSON, candidate returns `429`, and the
@@ -190,18 +243,32 @@ Beyond the format/test/build pipeline in [04-operations.md](04-operations.md):
 - **Trivy** scan of the built image, failing the build on HIGH or CRITICAL
   vulnerabilities with a fix available.
 - **CycloneDX SBOM** generated and attached to each release.
-- **Dependabot** for Maven and GitHub Actions, weekly.
+- **Dependabot** for Gradle and GitHub Actions, weekly.
+- **Gradle dependency verification** via `gradle/verification-metadata.xml`, so a
+  compromised or substituted artifact fails the build rather than shipping.
 - Actions pinned to commit SHAs, with a read-only default `GITHUB_TOKEN`.
 - Releases tagged semantically; images tagged with both the version and the git
   SHA so a running container is always traceable to a commit.
 
 ## Capacity and deployment
 
-Sizing follows directly from the two bounded terms above. At the defaults —
-`MAX_CONCURRENT_REQUESTS=200`, `SHADOW_QUEUE_SIZE=256`, `SHADOW_WORKERS=8`, 32 KB
-per payload — bounded state is roughly 15 MB. A 512 MB container limit with
-`-XX:MaxRAMPercentage=75` leaves generous room for JVM overhead and garbage
-collection headroom.
+Sizing follows from the bounded terms above. At the defaults —
+`MAX_CONCURRENT_REQUESTS=128`, `MAX_REQUEST_BYTES=128 KiB`,
+`MAX_RESPONSE_BYTES=256 KiB`, `SHADOW_BUDGET_BYTES=8 MiB`, `SHADOW_WORKERS=32` —
+application-controlled state peaks around 65 MB.
+
+Be honest about what that does and does not tell you: on the JVM, baseline
+footprint (heap reserve, metaspace, code cache, thread stacks, GC structures) is
+typically 150–250 MB and therefore **dominates** the total. The formula bounds the
+part of memory this design controls, which is the part that could otherwise grow
+without limit; it does not make the container small. Set the limit to **768 MB**
+with `-XX:MaxRAMPercentage=70`, and treat the bounded terms as the guarantee that
+load cannot push you past it rather than as the sizing input.
+
+Also validate at startup that `PRIMARY_MODEL != CANDIDATE_MODEL` unless an
+explicit `ALLOW_AA_MODE` flag is set. Comparing a model against itself by
+accident produces a beautiful, meaningless match rate near 100%, and nothing else
+in the system would flag it.
 
 Run **one process per container** and scale horizontally. Metrics are per
 instance, which is consistent with the non-goal already recorded in
@@ -214,10 +281,11 @@ in-flight work, a rollback costs nothing beyond a few dropped evaluations.
 
 ## Go-live checklist
 
-- Inbound auth enabled with keys issued per client, and `PROXY_API_KEYS` sourced
-  from the secret store.
+- Network path confirmed: the listener is reachable only from trusted callers,
+  because inbound authentication and rate limiting are
+  [deferred](#deferred-inbound-authentication-and-rate-limiting).
 - `DO_INFERENCE_API_KEY` rotated from any value used during development.
-- Rate limits and `MAX_CONCURRENT_REQUESTS` tuned against measured traffic.
+- `MAX_CONCURRENT_REQUESTS` tuned against measured traffic.
 - Container memory limit set above the computed bounded-state ceiling.
 - Prometheus scraping the management port; dashboards for latency, match rate,
   shed rate, and token spend.

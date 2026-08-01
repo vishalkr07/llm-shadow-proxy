@@ -24,12 +24,11 @@ primary and candidate are always compared on identical input.
 
 Constraints:
 
-- `Authorization: Bearer <proxy key>` required; see
-  [06-production-readiness.md](06-production-readiness.md#inbound-authentication).
-  This header is consumed by the proxy and never forwarded upstream.
 - `Content-Type: application/json` required.
-- Body size capped at `MAX_REQUEST_BYTES` (default 1 MB), enforced by a servlet
-  filter. Exceeding it returns `413`.
+- Any `Authorization` header the caller sends is consumed by the proxy and never
+  forwarded upstream; the upstream call carries our own credential instead.
+- Body size capped at `MAX_REQUEST_BYTES` (default 128 KiB), enforced by a
+  servlet filter. Exceeding it returns `413`.
 - `"stream": true` returns `400`; see the streaming decision in
   [README.md](README.md).
 
@@ -60,10 +59,8 @@ extra headers, no added latency.
 
 - `200` and any other upstream status — relayed from the primary model as-is.
 - `400` — malformed JSON body, or `stream: true`.
-- `401` — missing or unrecognised proxy API key.
 - `405` — method other than `POST`.
 - `413` — body exceeds `MAX_REQUEST_BYTES`.
-- `429` — per-key rate limit exceeded; includes `Retry-After`.
 - `502` — primary model unreachable or returned an unreadable response.
 - `503` — `MAX_CONCURRENT_REQUESTS` in flight; includes `Retry-After`.
 - `504` — primary model exceeded the primary read timeout.
@@ -76,55 +73,114 @@ error bodies.
 
 Real-time counters. Cheap, allocation-light, safe to scrape frequently. Served by
 a hand-written controller rather than Actuator, because the Objective specifies
-this exact path and summary. Requires the same bearer key as `/v1/chat`, since
-volume, error rates, and match quality are operational and competitive signal.
+this exact path and summary. Volume, error rates, and match quality are
+operational and competitive signal, which is the main reason authenticating this
+endpoint is on the
+[deferred list](06-production-readiness.md#deferred-inbound-authentication-and-rate-limiting)
+rather than off it.
 
 ```json
 {
+  "schema_version": "1",
+  "eval_version": "1",
+  "scope": "replica_local",
+  "replica_id": "shadow-proxy-7d4f9b6c8-x2mlq",
+  "uptime_seconds": 3600,
+
   "total_requests": 1482,
-  "shadow_enqueued": 1301,
-  "shadow_sampled_out": 0,
-  "shadow_shed": 181,
-  "shadow_completed": 1288,
-  "shadow_errors": 9,
-  "shadow_timeouts": 4,
-  "shadow_circuit_open": 0,
-  "evaluated": 1288,
-  "exact_matches": 1174,
-  "exact_match_rate": 91.15,
-  "invalid_json_primary": 3,
-  "invalid_json_candidate": 21,
-  "queue_depth": 12,
-  "queue_capacity": 256,
-  "uptime_seconds": 3600
+
+  "shadow": {
+    "eligible": 1470,
+    "enqueued": 1301,
+    "coverage_pct": 88.50,
+    "current_admit_probability": 1.0,
+    "shed_total": 169,
+    "shed_by_reason": {
+      "sampled_out": 0, "queue_full": 121, "byte_budget": 8,
+      "breaker_open": 0, "stale_in_queue": 40, "shutting_down": 0
+    },
+    "completed": 1288,
+    "errors": 9,
+    "timeouts": 4,
+    "queue_depth": 12,
+    "queue_capacity": 32,
+    "bytes_used": 61440,
+    "bytes_capacity": 8388608,
+    "in_flight": 7,
+    "workers": 32,
+    "breaker_state": "closed"
+  },
+
+  "evaluation": {
+    "evaluated": 1288,
+    "exact_matches": 1174,
+    "mismatches": 90,
+    "near_matches": 6,
+    "primary_unusable": 3,
+    "candidate_unusable": 21,
+    "both_unusable": 0,
+    "exact_match_rate": 92.88,
+    "exact_match_rate_basis": "exact_matches / (exact_matches + mismatches)",
+    "exact_match_rate_ci95": { "low": 91.30, "high": 94.19, "method": "wilson" },
+    "unusable_by_reason": {
+      "primary":   { "empty_content": 0, "content_truncated": 1, "not_json": 1,
+                     "trailing_garbage": 1, "not_object": 0,
+                     "action_absent": 0, "action_not_string": 0 },
+      "candidate": { "empty_content": 0, "content_truncated": 6, "not_json": 9,
+                     "trailing_garbage": 4, "not_object": 1,
+                     "action_absent": 1, "action_not_string": 0 }
+    },
+    "control_arm_aa": {
+      "evaluated": 12,
+      "exact_match_rate": 100.0,
+      "note": "primary-vs-primary noise floor; the A/B rate is only meaningful relative to this"
+    }
+  },
+
+  "cost": {
+    "primary_tokens": { "prompt": 412039, "completion": 82104 },
+    "candidate_tokens": { "prompt": 391182, "completion": 69041 }
+  },
+
+  "window_60s": {
+    "total_requests": 214,
+    "evaluated": 198,
+    "exact_match_rate": 91.12,
+    "exact_match_rate_ci95": { "low": 86.31, "high": 94.36, "method": "wilson" }
+  }
 }
 ```
 
-Field definitions:
+Field notes, covering only what is not self-evident:
 
-- `total_requests` — requests accepted on `POST /v1/chat`.
-- `shadow_enqueued` — jobs accepted onto the shadow queue.
-- `shadow_sampled_out` — requests not shadowed because of `SHADOW_SAMPLE_RATE`.
-  Zero at the default rate of `1.0`. Counted separately from `shadow_shed` so a
-  deliberate cost control is never mistaken for burst pressure.
-- `shadow_shed` — jobs dropped because the queue was full (load shed under burst).
-- `shadow_completed` — jobs a worker finished processing, success or failure.
-- `shadow_errors` — candidate call failed: transport error, non-2xx status,
-  unreadable body, or any other exception caught in the task.
-- `shadow_timeouts` — candidate exceeded its read timeout. Counted separately
-  from `shadow_errors`, not in addition to it.
-- `shadow_circuit_open` — jobs dropped without a network call because the
-  candidate circuit breaker was open.
-- `evaluated` — jobs where both primary and candidate outputs were available and
-  the heuristic actually ran. This is the denominator for the match rate.
-- `exact_matches` — evaluations where both sides parsed as JSON and their
-  `action` values were identical.
-- `exact_match_rate` — `exact_matches / evaluated * 100`, rounded to two
-  decimals, and exactly `0` when `evaluated == 0` (never `NaN`).
-- `invalid_json_primary` / `invalid_json_candidate` — diagnostic breakdown of
-  why evaluations failed to match.
-- `queue_depth` / `queue_capacity` — live saturation signal, read from the
-  executor's queue via `size()` and `size() + remainingCapacity()`.
+- `exact_match_rate_basis` is stated in the payload because the single most
+  common way this metric misleads is ambiguity about the denominator.
+  Unparseable responses are **excluded** from it, not counted as mismatches: a
+  candidate that emits prose has a *formatting* problem, and a candidate that
+  emits a different action has a *semantic* one. Averaging them together
+  produces a number that cannot drive either fix. Both populations are fully
+  reported alongside, so the stricter reading — treating unusable output as
+  non-matching — can be computed by the reader from the same payload.
+- `coverage_pct` is `enqueued / eligible`. A match rate over 3% of traffic and
+  one over 100% look identical without it, and only one of them supports a
+  decision.
+- `exact_match_rate_ci95` is a Wilson score interval. 89% from 50 samples is
+  noise; 89% from 50,000 is a fact, and the bare percentage cannot tell them
+  apart. Wilson is used rather than the normal approximation because it stays
+  well-behaved at small `n` and extreme `p`, and it is a cheap closed form.
+- `control_arm_aa` reports a small slice of shadow traffic sent to the **primary**
+  model instead of the candidate. Customer requests may use `temperature > 0`, so
+  some disagreement is sampling noise rather than model difference. Without this
+  noise floor an A/B rate is uninterpretable: if A/A is 96% and A/B is 93%, the
+  models are far closer than the raw gap suggests.
+- `window_60s` exists because lifetime counters are useless for a "real-time"
+  summary — a 30-point quality drop is invisible against a denominator of
+  millions. It is a ring of one-second buckets, fixed size, advanced lazily.
+- `shed_by_reason` separates deliberate sampling from overload from staleness,
+  because each demands a different response from an operator.
+- `scope` and `replica_id` are present so a reader can never mistake one
+  replica's view for the fleet's. Cross-replica aggregation is Prometheus's job.
+- `exact_match_rate` is exactly `0` when the denominator is zero, never `NaN`.
 
 The response record is serialised with explicit `@JsonProperty` snake_case names
 so the wire contract does not drift with Java field renames. Counters are
@@ -133,39 +189,68 @@ process-local and reset on restart, per the decision in [README.md](README.md).
 ## Deterministic evaluation rules
 
 Implemented as pure methods on a stateless evaluator so they are exhaustively
-unit-testable without Spring context. Given the primary and candidate
-completions:
+unit-testable without Spring context. Each side is parsed independently into a
+`SideResult` carrying either an action string or a specific failure reason, and
+the two are then compared.
 
-1. **Extract content.** Take `choices[0].message.content` from each. A missing or
-   blank content counts as invalid on that side.
-2. **Unwrap fences.** If the content is wrapped in a Markdown code fence
-   (```` ```json ... ``` ````), strip the fence before parsing, then trim
-   whitespace. Models frequently wrap JSON this way and treating it as invalid
-   would misreport the candidate. Nothing else is normalised.
-3. **Parse JSON.** Each side must parse into a JSON object via Jackson. Failure
-   sets the corresponding `invalid_json_*` counter, and the pair cannot match.
-4. **Extract `action`.** Read the top-level `action` field from both objects. It
-   must be present on both sides and must be a textual node.
-5. **Compare.** `String.equals`. No trimming, no case folding, no whitespace
-   collapsing, no unicode normalisation — determinism is the whole point of the
-   heuristic.
+Per side, in this order:
 
-The outcome of every evaluation is exactly one value of an `EvalResult` enum:
-`MATCH`, `MISMATCH`, `INVALID_PRIMARY`, `INVALID_CANDIDATE`, `INVALID_BOTH`,
-`MISSING_ACTION`. Each maps to a specific counter update in a single `switch`,
-so the numbers on `/metric` always reconcile.
+1. **Truncation first.** If `finish_reason` is `length`, or the content hit
+   `MAX_EVAL_CONTENT_BYTES`, the side is `CONTENT_TRUNCATED`. This is checked
+   *before* parsing, because a cut-off payload will not parse and reporting it as
+   malformed JSON would blame the model for what is actually a `max_tokens`
+   misconfiguration.
+2. **Extract content.** `choices[0].message.content`. Missing, empty, or
+   whitespace-only is `EMPTY_CONTENT`.
+3. **Unwrap fences.** A single surrounding Markdown code fence
+   (```` ```json ... ``` ````) is stripped, then whitespace trimmed. Models emit
+   these constantly; rejecting them would make the metric measure prompt
+   formatting rather than model behaviour. Nothing else is normalised.
+4. **Parse JSON**, and require the payload to be exactly one JSON value. Prose
+   around the JSON (`Sure! Here you go: {"action":"refund"}`) is
+   `TRAILING_GARBAGE`, not a match. We deliberately do not scan for the first
+   `{`: that heuristic is non-deterministic on adversarial output and can lift
+   JSON out of an example embedded in prose, and determinism is the entire point.
+5. **Require an object.** A top-level array or scalar is `NOT_OBJECT`.
+6. **Extract `action`.** Absent is `ACTION_ABSENT`; present but not a string is
+   `ACTION_NOT_STRING`. No coercion — `1` and `"1"` are different values.
+
+Then compare: `String.equals` on the two action values. No trimming, no case
+folding, no whitespace collapsing, no unicode normalisation.
+
+The outcome is exactly one value of an `EvalResult` enum: `MATCH`, `MISMATCH`,
+`PRIMARY_UNUSABLE`, `CANDIDATE_UNUSABLE`, `BOTH_UNUSABLE`. Each maps to a counter
+update in a single `switch`, and the per-side reason is recorded separately so
+the numbers on `/metric` always reconcile.
+
+Two deliberate refinements:
+
+- **Near-match is reported, not accepted.** `"Refund"` versus `"refund"` is a
+  mismatch, because a downstream consumer doing `switch (action)` would break on
+  it. But strictness has a cost, so `near_match_total` counts pairs equal after
+  case folding and trimming, making that cost visible instead of hidden.
+- **`eval_version` is stamped into `/metric`.** When this logic changes the match
+  rate moves for reasons unrelated to the models. Without a version stamp,
+  somebody spends a week debugging a model regression that was a fence-stripping
+  bug fix.
 
 ### Worked examples
 
 - Primary `{"action":"refund"}` vs candidate `{"action":"refund"}` — match.
 - Primary `{"action":"refund"}` vs candidate `{"action":"Refund"}` — mismatch,
-  deliberately, because comparison is case-sensitive.
+  deliberately, because comparison is case-sensitive. Also counted in
+  `near_match_total`.
 - Primary `{"action":"refund"}` vs candidate ```` ```json\n{"action":"refund"}\n``` ````
   — match, after fence stripping.
 - Primary `{"action":"refund","confidence":0.9}` vs candidate
   `{"action":"refund"}` — match; only `action` is compared.
-- Primary `{"action":"refund"}` vs candidate `Sure! I'd refund that.` — no match,
-  `invalid_json_candidate` increments.
+- Primary `{"action":"refund"}` vs candidate `Sure! I'd refund that.` — candidate
+  `NOT_JSON`, so `CANDIDATE_UNUSABLE`.
+- Primary `{"action":"refund"}` vs candidate `Here you go: {"action":"refund"}` —
+  candidate `TRAILING_GARBAGE`, not a match, by design.
+- Candidate cut off mid-object with `finish_reason: "length"` —
+  `CONTENT_TRUNCATED`, never reported as malformed JSON.
+- Primary `{"action":1}` — `ACTION_NOT_STRING`; no coercion to `"1"`.
 
 ## Upstream contract (DigitalOcean Serverless Inference)
 

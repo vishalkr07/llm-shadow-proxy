@@ -144,8 +144,9 @@ Owns the customer-facing contract and nothing else.
 - Serves `POST /v1/chat` and `GET /metric`.
 - Enforces `MAX_REQUEST_BYTES`, content type, and the `stream: true` rejection.
 - Calls the primary model and relays status and body verbatim.
-- Hands a `ShadowJob` to EVAL **after** the response is written, and only when
-  the primary call succeeded.
+- Hands a `ShadowJob` to EVAL once the primary response is **in hand but not yet
+  written to the socket**, and only when the primary call succeeded. The hand-off
+  is non-blocking, so it cannot delay the write.
 - Reads a snapshot from METRICS to serve `/metric`.
 
 Does not: know what evaluation means, interpret the candidate, or touch the
@@ -196,9 +197,22 @@ public interface Evaluator {
     EvalResult compare(byte[] primaryBody, byte[] candidateBody);
 }
 
-public enum EvalResult {
-    MATCH, MISMATCH, INVALID_PRIMARY, INVALID_CANDIDATE, INVALID_BOTH, MISSING_ACTION
+public enum EvalVerdict {
+    MATCH, MISMATCH, PRIMARY_UNUSABLE, CANDIDATE_UNUSABLE, BOTH_UNUSABLE
 }
+
+/** Why one side could not be compared. Null when that side was usable. */
+public enum UnusableReason {
+    EMPTY_CONTENT, CONTENT_TRUNCATED, NOT_JSON, TRAILING_GARBAGE,
+    NOT_OBJECT, ACTION_ABSENT, ACTION_NOT_STRING
+}
+
+public record EvalResult(
+    EvalVerdict verdict,
+    UnusableReason primaryReason,     // nullable
+    UnusableReason candidateReason,   // nullable
+    boolean nearMatch                 // MISMATCH that is equal after case-folding and trimming
+) {}
 
 public enum ShadowOutcome { OK, ERROR, TIMEOUT, SHED }
 
@@ -244,7 +258,7 @@ We would revisit if any of these became true, and none are today:
 
 **One application image.** Multi-stage build, dependency layer cached separately
 from application classes, `eclipse-temurin:21-jre` runtime, non-root user,
-healthcheck against `/actuator/health`, `-XX:MaxRAMPercentage=75` so the JVM
+healthcheck against `/actuator/health`, `-XX:MaxRAMPercentage=70` so the JVM
 sizes its heap from the container limit.
 
 **`docker-compose.yaml` for local development only**, running two containers:

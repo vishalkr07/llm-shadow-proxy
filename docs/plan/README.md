@@ -12,6 +12,11 @@ truth and must not be edited; everything here is the design that satisfies it.
 - [04-operations.md](04-operations.md) — configuration, CI/CD, deployment, observability, runbook
 - [05-service-topology.md](05-service-topology.md) — one service vs three, the three frozen components, Docker topology
 - [06-production-readiness.md](06-production-readiness.md) — security, resilience, SLOs, supply chain, go-live checklist
+- [07-design-review.md](07-design-review.md) — independent architecture review, what we adopted and what we rejected
+
+The architecture flow diagram the Objective asks for is a deliverable in its own
+right rather than a working document, so it lives outside this folder:
+[../architecture.md](../architecture.md).
 
 ## What we are building, in one paragraph
 
@@ -45,9 +50,11 @@ These are settled so implementation can start without further questions.
   Actuator health checks out of the box.
 - **HTTP client: Spring `RestClient`**, one bean per upstream so the primary and
   candidate can carry different timeouts.
-- **Build: Maven via the Maven Wrapper (`./mvnw`).** No Maven or Gradle is
-  installed in the container, and the wrapper bootstraps itself, so a clone can
-  build with nothing but a JDK.
+- **Build: Gradle via the Gradle Wrapper (`./gradlew`), Kotlin DSL.** No Gradle
+  is installed in the container, and the wrapper bootstraps a pinned,
+  checksum-verified distribution, so a clone builds with nothing but a JDK.
+  Dependencies are declared in a version catalog at
+  `gradle/libs.versions.toml`.
 - **Concurrency model: virtual threads for the request path, a fixed platform
   thread pool for the shadow path.** `spring.threads.virtual.enabled=true` keeps
   the synchronous primary call from pinning platform threads, while the shadow
@@ -62,14 +69,24 @@ These are settled so implementation can start without further questions.
   restart, and this is documented as intentional. `/metric` is hand-written
   rather than delegated to Actuator, because the Objective specifies that exact
   path and payload.
-- **Load-shed policy: drop-newest.** When the shadow queue is full, the incoming
-  job is discarded and a `shadow_shed` counter is incremented. Shedding is a
-  normal, observable outcome, not an error.
+- **Load-shed policy: uniform random admission, backed by three hard gates.**
+  Under pressure the dispatcher drops a *random* subset rather than simply
+  refusing whatever arrives once the queue is full, because tail-dropping biases
+  the very match rate this service exists to report. A count gate, a byte-budget
+  gate, and a task TTL sit behind it as hard bounds. Reasoning in
+  [01-architecture.md](01-architecture.md#load-shedding-and-why-it-is-not-just-drop-when-full).
+- **Concurrency constants are derived from the upstream rate limit**, not
+  guessed. DigitalOcean's documented default is 250 requests/minute and 5,000
+  per hour, with tier-dependent serverless limits on top, so the limit is
+  configuration and the pool sizes follow from it by Little's law. See
+  [04-operations.md](04-operations.md#deriving-the-concurrency-constants).
 - **The service is treated as production infrastructure, not a demo.** Inbound
-  requests are authenticated and rate limited, inbound concurrency is bounded,
-  each upstream gets its own connection pool, the candidate sits behind a circuit
-  breaker, and probes never depend on upstream health. All of it is specified in
-  [06-production-readiness.md](06-production-readiness.md).
+  concurrency and request size are bounded, each upstream gets its own connection
+  pool, the candidate sits behind a circuit breaker, and probes never depend on
+  upstream health. All of it is specified in
+  [06-production-readiness.md](06-production-readiness.md). Inbound client
+  authentication is the one production control deliberately left out of v1; see
+  the non-goals below.
 - **Streaming (`"stream": true`): rejected in v1** with `400`. Shadow comparison
   requires a complete JSON body from both models; supporting streaming would mean
   buffering full responses and re-emitting them, which is out of scope.
@@ -77,6 +94,10 @@ These are settled so implementation can start without further questions.
 ## Non-goals
 
 - Editing [`docs/Objective.md`](../Objective.md).
+- Inbound client authentication and per-key rate limiting. Both are deferred out
+  of v1; the design, the reason it matters, and the operational caveat that the
+  service must not sit on an untrusted network until then are recorded in
+  [06-production-readiness.md](06-production-readiness.md#deferred-inbound-authentication-and-rate-limiting).
 - Persisting evaluations to a database or aggregating metrics across replicas.
 - Semantic or LLM-as-judge scoring. The Objective specifies a deterministic
   heuristic, and determinism is the point.

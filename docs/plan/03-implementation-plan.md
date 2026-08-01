@@ -1,7 +1,7 @@
 # Implementation Plan
 
-Stack: **Java 21 (LTS), Spring Boot 4.1, Maven Wrapper.** See
-[README.md](README.md) for why.
+Stack: **Java 21 (LTS), Spring Boot 4.1, Gradle (Kotlin DSL) via the wrapper.**
+See [README.md](README.md) for why.
 
 Topology: **one service, one image, three frozen components** — API (proxy),
 EVAL (shadow), METRICS. The package tree below maps one-to-one onto those
@@ -12,8 +12,11 @@ components, and the interfaces between them are fixed in
 
 ```
 .
-├── mvnw / mvnw.cmd / .mvn/           Maven Wrapper (no local Maven needed)
-├── pom.xml
+├── gradlew / gradlew.bat / gradle/   Gradle Wrapper (no local Gradle needed)
+│   ├── libs.versions.toml            version catalog: single source of versions
+│   └── verification-metadata.xml     dependency checksum verification
+├── build.gradle.kts
+├── settings.gradle.kts
 ├── src/main/java/com/example/shadowproxy/
 │   ├── ShadowProxyApplication.java   entry point
 │   ├── config/
@@ -32,15 +35,13 @@ components, and the interfaces between them are fixed in
 │   │   └── ShadowTask.java           candidate call + eval + counters
 │   ├── eval/
 │   │   ├── Evaluator.java            deterministic heuristic (pure)
-│   │   └── EvalResult.java           MATCH / MISMATCH / INVALID_* / MISSING_ACTION
+│   │   └── EvalResult.java           MATCH / MISMATCH / *_UNUSABLE + per-side reason
 │   ├── metrics/
 │   │   ├── MetricsRegistry.java      LongAdder counters
 │   │   ├── MetricsSnapshot.java      immutable record, snake_case JSON
 │   │   └── MetricController.java     GET /metric
 │   └── web/
-│       ├── ApiKeyAuthFilter.java     inbound bearer auth, constant-time compare
 │       ├── ConcurrencyLimitFilter.java  MAX_CONCURRENT_REQUESTS semaphore
-│       ├── RateLimitFilter.java      per-key token bucket
 │       ├── RequestIdFilter.java      correlation id into MDC and response
 │       └── RequestSizeLimitFilter.java  MAX_REQUEST_BYTES enforcement
 ├── src/main/resources/application.yaml
@@ -64,7 +65,10 @@ Deliverable: the application boots, serves both routes with stub behaviour, and
 shuts down cleanly.
 
 - Generate the Spring Boot 4.1 project (web + validation + actuator), commit the
-  Maven Wrapper so `./mvnw` works with only a JDK present.
+  Gradle Wrapper so `./gradlew` works with only a JDK present. Declare every
+  dependency in `gradle/libs.versions.toml`, enable the configuration cache, and
+  register a separate `integrationTest` source set so slow WireMock suites do not
+  run on every `test` invocation.
 - `ProxyProperties`: a `@ConfigurationProperties`-bound record with
   `@NotBlank` / `@Positive` constraints, so a missing API key or model name fails
   at startup rather than on the first request. Bind through explicit
@@ -81,9 +85,12 @@ shuts down cleanly.
 Deliverable: `POST /v1/chat` proxies to the primary model and returns its
 response verbatim.
 
-- `InferenceClientConfig`: two `RestClient` beans over a shared connection pool,
-  differing only in read timeout (`PRIMARY_TIMEOUT` vs `SHADOW_TIMEOUT`), each
-  with the `Authorization` header applied by a default-header callback.
+- `InferenceClientConfig`: two `RestClient` beans, each with **its own connection
+  pool** and its own read timeout (`PRIMARY_TIMEOUT` vs `SHADOW_TIMEOUT`), and the
+  `Authorization` header applied by a default-header callback. The pools must not
+  be shared: both models resolve to the same host, so one pool would let shadow
+  workers occupy the connections the customer path needs. Sizing in
+  [06-production-readiness.md](06-production-readiness.md#separate-connection-pools).
 - `InferenceClient.complete(model, bodyBytes)`: overrides the `model` field on
   the incoming payload and returns status plus raw body, with default 4xx/5xx
   exception translation disabled so error bodies pass through.
@@ -103,9 +110,19 @@ Deliverable: shadow execution that provably cannot affect the primary path.
 
 - `ShadowExecutorConfig`: construct `ThreadPoolExecutor` explicitly with
   `ArrayBlockingQueue(SHADOW_QUEUE_SIZE)`, `SHADOW_WORKERS` core and max threads,
-  a named daemon `ThreadFactory`, and a `RejectedExecutionHandler` that
-  increments `shadowShed` and returns. Explicitly not `CallerRunsPolicy`, which
-  would run the candidate call on the request thread.
+  a named daemon `ThreadFactory`, and a `RejectedExecutionHandler` that records a
+  `QUEUE_FULL` shed and returns. Explicitly not `CallerRunsPolicy`, which would
+  run the candidate call on the request thread.
+- `AdmissionController`: the uniform-random sampler plus the byte-budget
+  reservation. The budget is an `AtomicLong` updated by a compare-and-set loop so
+  it is never exceeded even transiently, and the reservation is released in a
+  `finally` block when the task completes, so it covers queued and in-flight work
+  alike. A governor task recomputes the admission probability once a second from
+  an EWMA of arrivals.
+- Staleness check at dequeue against `SHADOW_TASK_TTL`, before the candidate call.
+- `ArchUnitTest`: fail the build if `shadow` or `eval` imports `jakarta.servlet`
+  or `org.springframework.web`, making the isolation guarantee structural rather
+  than reviewed.
 - `@PreDestroy`: `shutdown()` then `awaitTermination(SHUTDOWN_GRACE)`.
 - `ShadowDispatcher.submit(job)`: applies `SHADOW_SAMPLE_RATE` first (counting
   `shadowSampledOut`), then one `executor.execute(...)` call, incrementing
@@ -114,8 +131,13 @@ Deliverable: shadow execution that provably cannot affect the primary path.
   counters, and wraps everything in `try/catch (Throwable)` so nothing escapes
   into the pool. Distinguishes read timeout from other failures for the
   timeout counter.
-- Wire the controller to submit **after** the response is written, and skip
-  submission entirely when the primary call failed.
+- Wire the controller to submit once the primary response is **in hand but not
+  yet written to the socket**, and skip submission entirely when the primary call
+  failed. Submitting after the socket write would couple enqueue time to client
+  network speed: a slow or distant client could delay the hand-off by seconds,
+  pushing jobs toward their TTL and quietly under-sampling exactly those
+  requests. Submission is a bounded, non-blocking, allocation-free operation, so
+  it costs the customer nothing measurable.
 - Copy everything the task needs into `ShadowJob` at submit time; never touch
   `HttpServletRequest` or request-scoped state from a worker.
 
@@ -127,12 +149,15 @@ drops and thread count stays flat.
 
 Deliverable: the heuristic from [02-api-contract.md](02-api-contract.md).
 
-- `Evaluator.compare(byte[] primary, byte[] candidate)` returning `EvalResult`,
-  with no I/O and no logging.
-- Content extraction, fence stripping, Jackson parse, `action` extraction, exact
-  string comparison.
-- `ShadowTask` translates the `EvalResult` into counter updates through a single
+- `Evaluator.compare(...)` returning `EvalResult` plus per-side reasons, with no
+  I/O, no logging, no clock, and no state.
+- Per side in order: truncation check, content extraction, fence stripping,
+  Jackson parse with a single-value requirement, object check, `action`
+  extraction, then exact string comparison.
+- `ShadowTask` translates the result into counter updates through a single
   `switch`, so the mapping can be read at a glance.
+- `EVAL_VERSION` constant surfaced in `/metric`, bumped on any behavioural
+  change so a shift in the match rate is never misattributed to the models.
 
 ## Phase 5 — Metrics endpoint
 
@@ -141,8 +166,12 @@ Deliverable: `GET /metric` returning the live summary.
 - `MetricsRegistry`: `LongAdder` fields plus `snapshot()` returning
   `MetricsSnapshot`; rate computed at read time with a zero guard on the
   denominator.
+- Wilson score interval helper, and a fixed-size ring of one-second buckets for
+  the `window_60s` block, advanced lazily against a monotonic clock.
+- A/A control arm: `SHADOW_CONTROL_ARM_RATE` of jobs routed to the primary model,
+  accounted separately so it never contaminates the A/B numbers.
 - `MetricController`: return the snapshot with `Cache-Control: no-store`,
-  including `queue_depth`, `queue_capacity`, and uptime.
+  including queue depth and byte-budget saturation.
 
 ## Phase 6 — Tests
 
@@ -150,8 +179,12 @@ Deliverable: the behavioural claims in these documents are enforced by tests.
 JUnit 5, WireMock for the upstream, Awaitility for asynchronous assertions.
 
 - `Evaluator` parameterised tests: match, case-sensitive mismatch, fenced JSON,
-  extra keys, prose response, missing `action`, non-textual `action`, blank
-  content.
+  extra keys, prose response, prose wrapping valid JSON, truncated content,
+  missing `action`, non-textual `action`, blank content.
+- `Evaluator` properties: determinism over repeated invocation, and reflexivity —
+  `compare(x, x)` must never yield `MISMATCH` for any `x`, a violation of which
+  means the parser is non-deterministic. Fuzzed over arbitrary byte input for
+  absence of exceptions.
 - `MetricsRegistry`: rate math including the `evaluated == 0` zero-guard, and
   concurrent increments driven from multiple threads.
 - Executor: submission when the queue is full increments `shadowShed` and returns
@@ -161,6 +194,10 @@ JUnit 5, WireMock for the upstream, Awaitility for asynchronous assertions.
   byte-identical; oversized body yields `413`; `stream: true` yields `400`.
 - Burst test: N requests against a size-2 queue, asserting
   `shadow_enqueued + shadow_shed == total_requests` and bounded thread growth.
+- Byte-budget invariant: hammer admission from many threads and assert the
+  reserved total never exceeds `SHADOW_BUDGET_BYTES` at any observation, and that
+  it returns to exactly zero after drain — a non-zero residue is a reservation
+  leak, which is precisely the bug that would invalidate the memory bound.
 - A test that asserts evaluation still completes after the client response is
   finished, guarding the request-context-detachment hazard from
   [01-architecture.md](01-architecture.md).
@@ -177,8 +214,8 @@ Deliverable: everything in
 [06-production-readiness.md](06-production-readiness.md) that is code rather
 than process.
 
-- `ApiKeyAuthFilter`, `RateLimitFilter`, `ConcurrencyLimitFilter`, and
-  `RequestIdFilter`, ordered so authentication runs before any work is done.
+- `ConcurrencyLimitFilter` and `RequestIdFilter`, ordered so the in-flight cap is
+  applied before any work is done.
 - Separate connection pools per upstream, sized to `MAX_CONCURRENT_REQUESTS` and
   `SHADOW_WORKERS` respectively, with a distinct `CONNECT_TIMEOUT`.
 - Resilience4j circuit breaker on the candidate call only, with the
@@ -189,9 +226,8 @@ than process.
 - Shutdown that finishes in-flight primary requests and discards the shadow
   queue, counting `shadow_dropped_shutdown`.
 
-Exit check: an unauthenticated request gets `401`; exceeding the concurrency cap
-gets `503` rather than growing the heap; killing the candidate trips the breaker
-and stops the calls.
+Exit check: exceeding the concurrency cap gets `503` rather than growing the
+heap; killing the candidate trips the breaker and stops the calls.
 
 ## Phase 8 — Documentation and CI/CD
 
@@ -204,11 +240,12 @@ Deliverable: the artifacts the Objective's "TO build" section names.
   with the `(queue + workers) x bytes_per_job` formula.
 - Keep the architecture diagrams in [01-architecture.md](01-architecture.md) and
   link them from the README rather than duplicating them.
-- `.github/workflows/ci.yml`: on push and PR — Spotless format check, compile,
-  `./mvnw verify` (unit plus integration tests), and a Docker image build, with
-  Temurin 21 and Maven dependency caching via `actions/setup-java`.
-- `Dockerfile`: multi-stage, dependency layer cached separately from application
-  classes, `eclipse-temurin:21-jre` runtime, non-root user.
+- `.github/workflows/ci.yml`: on push and PR — `spotlessCheck`, the ArchUnit
+  isolation rules, `./gradlew build` (unit plus integration tests), and a Docker
+  image build, with Temurin 21 and caching via `gradle/actions/setup-gradle`.
+- `Dockerfile`: multi-stage, Spring Boot layered-jar extraction so dependencies
+  and application classes occupy separate layers, `eclipse-temurin:21-jre` pinned
+  by digest, non-root user.
 - `docker-compose.yaml`: the app plus a WireMock `mock-inference` container, so
   `docker compose up` demonstrates shedding, timeouts, and mismatches with no API
   key. See
@@ -219,8 +256,8 @@ Deliverable: the artifacts the Objective's "TO build" section names.
 - **M1 — Transparent proxy.** Phases 1–2. Primary traffic served correctly.
 - **M2 — Isolated shadowing.** Phase 3. Burst protection demonstrated.
 - **M3 — Full Objective.** Phases 4–5. Evaluation and `/metric` complete.
-- **M4 — Hardened.** Phases 6–7. Tests green under load, auth, limits, breaker,
-  and telemetry in place.
+- **M4 — Hardened.** Phases 6–7. Tests green under load, with the concurrency
+  cap, breaker, and telemetry in place.
 - **M5 — Production ready.** Phase 8. CI, image scanning, docs published, and
   the go-live checklist in
   [06-production-readiness.md](06-production-readiness.md#go-live-checklist)
