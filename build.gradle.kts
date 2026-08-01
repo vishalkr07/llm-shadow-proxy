@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.example"
-version = "0.1.0"
+version = providers.gradleProperty("version").orElse("0.1.0").get()
 
 java {
     toolchain {
