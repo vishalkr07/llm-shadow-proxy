@@ -69,10 +69,13 @@ class ChatProxyIntegrationTest {
 
         assertThat(response.statusCode()).isEqualTo(201);
         assertThat(response.body()).isEqualTo(expected);
+        awaitCandidateRequest();
         assertThat(UPSTREAM.lastAuthorization()).isEqualTo("Bearer test-key");
         assertThat(UPSTREAM.lastBody()).contains("\"model\":\"primary-model\"");
         assertThat(UPSTREAM.lastBody()).doesNotContain("attacker-choice");
         assertThat(UPSTREAM.lastShadowHeader()).isNull();
+        assertThat(UPSTREAM.lastCandidateBody()).contains("\"model\":\"candidate-model\"");
+        assertThat(UPSTREAM.lastCandidateShadowHeader()).isEqualTo("true");
     }
 
     @Test
@@ -139,6 +142,7 @@ class ChatProxyIntegrationTest {
         assertThat(rejected.statusCode()).isEqualTo(503);
         assertThat(rejected.headers().firstValue("Retry-After")).contains("1");
         first.get(2, TimeUnit.SECONDS);
+        awaitCandidateRequest();
     }
 
     private HttpResponse<byte[]> send(String json, String authorization) throws Exception {
@@ -152,13 +156,24 @@ class ChatProxyIntegrationTest {
         return client.send(request.build(), HttpResponse.BodyHandlers.ofByteArray());
     }
 
+    private void awaitCandidateRequest() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (UPSTREAM.candidateRequestCount() == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(UPSTREAM.candidateRequestCount()).isEqualTo(1);
+    }
+
     private static final class UpstreamStub implements AutoCloseable {
         private final HttpServer server;
         private final ExecutorService executor = Executors.newCachedThreadPool();
         private final AtomicInteger requests = new AtomicInteger();
         private final AtomicReference<String> lastAuthorization = new AtomicReference<>();
-        private final AtomicReference<String> lastShadowHeader = new AtomicReference<>();
-        private final AtomicReference<String> lastBody = new AtomicReference<>();
+        private final AtomicReference<String> lastPrimaryShadowHeader = new AtomicReference<>();
+        private final AtomicReference<String> lastPrimaryBody = new AtomicReference<>();
+        private final AtomicReference<String> lastCandidateShadowHeader = new AtomicReference<>();
+        private final AtomicReference<String> lastCandidateBody = new AtomicReference<>();
+        private final AtomicInteger candidateRequests = new AtomicInteger();
         private volatile int status = 200;
         private volatile byte[] response = "{\"choices\":[]}".getBytes(StandardCharsets.UTF_8);
         private volatile Duration delay = Duration.ZERO;
@@ -183,8 +198,17 @@ class ChatProxyIntegrationTest {
         private void handle(HttpExchange exchange) throws IOException {
             requests.incrementAndGet();
             lastAuthorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
-            lastShadowHeader.set(exchange.getRequestHeaders().getFirst("X-Shadow-Request"));
-            lastBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String shadowHeader = exchange.getRequestHeaders().getFirst("X-Shadow-Request");
+            String body =
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            if ("true".equals(shadowHeader)) {
+                candidateRequests.incrementAndGet();
+                lastCandidateShadowHeader.set(shadowHeader);
+                lastCandidateBody.set(body);
+            } else {
+                lastPrimaryShadowHeader.set(shadowHeader);
+                lastPrimaryBody.set(body);
+            }
             CountDownLatch currentEntered = entered;
             if (currentEntered != null) {
                 currentEntered.countDown();
@@ -212,9 +236,12 @@ class ChatProxyIntegrationTest {
 
         private void reset() {
             requests.set(0);
+            candidateRequests.set(0);
             lastAuthorization.set(null);
-            lastShadowHeader.set(null);
-            lastBody.set(null);
+            lastPrimaryShadowHeader.set(null);
+            lastPrimaryBody.set(null);
+            lastCandidateShadowHeader.set(null);
+            lastCandidateBody.set(null);
             status = 200;
             response = "{\"choices\":[]}".getBytes(StandardCharsets.UTF_8);
             delay = Duration.ZERO;
@@ -250,11 +277,23 @@ class ChatProxyIntegrationTest {
         }
 
         private String lastShadowHeader() {
-            return lastShadowHeader.get();
+            return lastPrimaryShadowHeader.get();
         }
 
         private String lastBody() {
-            return lastBody.get();
+            return lastPrimaryBody.get();
+        }
+
+        private int candidateRequestCount() {
+            return candidateRequests.get();
+        }
+
+        private String lastCandidateShadowHeader() {
+            return lastCandidateShadowHeader.get();
+        }
+
+        private String lastCandidateBody() {
+            return lastCandidateBody.get();
         }
 
         @Override

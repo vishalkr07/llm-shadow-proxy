@@ -59,7 +59,12 @@ public record ProxyProperties(
             @Positive long budgetBytes,
             @NotNull Duration taskTtl,
             @DecimalMin("0.0") @DecimalMax("1.0") double sampleRate,
-            @DecimalMin("0.0") @DecimalMax("1.0") double controlArmRate) {}
+            @DecimalMin("0.0") @DecimalMax("1.0") double controlArmRate) {
+        @AssertTrue(message = "SHADOW_TASK_TTL must be positive")
+        public boolean isTaskTtlPositive() {
+            return taskTtl != null && !taskTtl.isZero() && !taskTtl.isNegative();
+        }
+    }
 
     @AssertTrue(message = "SHADOW_QUEUE_SIZE must be greater than or equal to SHADOW_WORKERS")
     public boolean isQueueLargeEnough() {
